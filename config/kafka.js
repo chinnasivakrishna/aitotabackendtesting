@@ -7,7 +7,7 @@ const brokers = (process.env.KAFKA_BROKER || '')
   .filter(Boolean);
 
 const kafka = new Kafka({
-  clientId: process.env.KAFKA_CLIENT_ID || 'aitota-backend',
+  clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
   brokers,
   ssl: true,
   sasl: {

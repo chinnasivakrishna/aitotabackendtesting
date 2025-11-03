@@ -4,6 +4,8 @@ const cors = require('cors');
 const connectDB = require('./config/db');
 const axios = require('axios');
 const http = require('http');
+const { Kafka } = require('kafkajs');
+const { awsIamAuthenticator, Type: AWS_MSK_IAM } = require('@jm18457/kafkajs-msk-iam-authentication-mechanism');
 const VoiceChatWebSocketServer = require('./websocketServer');
 const superadminRoutes = require('./routes/superadminroutes')
 const adminRoutes = require('./routes/adminroutes');
@@ -1709,6 +1711,27 @@ const PORT = process.env.PORT || 4000;
 connectDB().then(async () => {
     // Always run maintenance on startup
     try {
+        // Optional: quick MSK IAM connectivity test (non-blocking)
+        try {
+            const brokers = (process.env.KAFKA_BROKER || '').split(',').map(b => b.trim()).filter(Boolean);
+            if (brokers.length) {
+                const kafka = new Kafka({
+                    clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
+                    brokers,
+                    ssl: true,
+                    sasl: {
+                        mechanism: AWS_MSK_IAM,
+                        authenticationProvider: awsIamAuthenticator({ region: process.env.AWS_REGION || 'ap-south-1' })
+                    }
+                });
+                const testProducer = kafka.producer();
+                await testProducer.connect();
+                console.log('✅ Connected to MSK cluster via IAM Auth');
+                await testProducer.disconnect();
+            }
+        } catch (e) {
+            console.warn('⚠️ Kafka IAM connectivity test failed:', e.message);
+        }
         const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');
         await fixStuckCalls();
         console.log('✅ SERVER RESTART: Stuck calls check completed');
