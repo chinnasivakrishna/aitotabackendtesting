@@ -1714,7 +1714,13 @@ connectDB().then(async () => {
         // Optional: quick MSK IAM connectivity test (non-blocking)
         try {
             const brokers = (process.env.KAFKA_BROKER || '').split(',').map(b => b.trim()).filter(Boolean);
+            console.log('🧩 Kafka config:', {
+                region: process.env.AWS_REGION || 'ap-south-1',
+                clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
+                brokers
+            });
             if (brokers.length) {
+                console.log('🔎 Attempting Kafka IAM connect test...');
                 const kafka = new Kafka({
                     clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
                     brokers,
@@ -1726,11 +1732,14 @@ connectDB().then(async () => {
                 });
                 const testProducer = kafka.producer();
                 await testProducer.connect();
-                console.log('✅ Connected to MSK cluster via IAM Auth');
+                console.log('✅ Kafka MSK IAM: Connected');
                 await testProducer.disconnect();
+                console.log('🔌 Kafka MSK IAM: Disconnected (test complete)');
+            } else {
+                console.warn('⚠️ Kafka test skipped: KAFKA_BROKER env not set');
             }
         } catch (e) {
-            console.warn('⚠️ Kafka IAM connectivity test failed:', e.message);
+            console.warn('⚠️ Kafka IAM connectivity test failed:', e && (e.stack || e.message || e));
         }
         const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');
         await fixStuckCalls();
