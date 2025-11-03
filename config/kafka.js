@@ -11,6 +11,37 @@ const kafka = new Kafka({
   logLevel: logLevel.INFO,
 });
 
-const producer = kafka.producer();
-producer.connect().catch(() => {});
-module.exports = producer;
+let producer = null;
+
+async function getProducer() {
+  try {
+    if (!producer) {
+      producer = kafka.producer();
+      await producer.connect();
+    }
+  } catch (_) {
+    // If connect failed, reset and try once more on demand
+    try {
+      producer = kafka.producer();
+      await producer.connect();
+    } catch (e2) {
+      throw e2;
+    }
+  }
+  return producer;
+}
+
+async function recreateProducer() {
+  try {
+    if (producer) {
+      try { await producer.disconnect(); } catch (_) {}
+    }
+    producer = kafka.producer();
+    await producer.connect();
+    return producer;
+  } catch (e) {
+    throw e;
+  }
+}
+
+module.exports = { getProducer, recreateProducer };

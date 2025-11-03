@@ -1737,9 +1737,9 @@ connectDB().then(async () => {
           } else {
               console.warn('⚠️ Kafka test skipped: KAFKA_BROKER env not set');
           }
-      } catch (e) {
-          console.warn('⚠️ Kafka IAM connectivity test failed:', e && (e.stack || e.message || e));
-      }
+        } catch (e) {
+            console.warn('⚠️ Kafka TLS connectivity test failed:', e && (e.stack || e.message || e));
+        }
       
         const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');
         await fixStuckCalls();
