@@ -12,6 +12,7 @@ const kafka = new Kafka({
 });
 
 let producer = null;
+let admin = null;
 
 async function getProducer() {
   try {
@@ -44,4 +45,30 @@ async function recreateProducer() {
   }
 }
 
-module.exports = { getProducer, recreateProducer };
+async function getAdmin() {
+  if (!admin) {
+    admin = kafka.admin();
+    await admin.connect();
+  }
+  return admin;
+}
+
+async function ensureTopics(topicNames = []) {
+  if (!Array.isArray(topicNames) || topicNames.length === 0) return;
+  const admin = await getAdmin();
+  try {
+    const existing = await admin.listTopics();
+    const toCreate = topicNames.filter(t => !existing.includes(t));
+    if (toCreate.length) {
+      await admin.createTopics({
+        topics: toCreate.map(name => ({ topic: name, numPartitions: 1, replicationFactor: 3 })),
+        waitForLeaders: true
+      });
+    }
+  } catch (e) {
+    // Log only; sending code will still retry
+    console.warn('[kafka] ensureTopics failed:', e?.message || e);
+  }
+}
+
+module.exports = { getProducer, recreateProducer, getAdmin, ensureTopics };

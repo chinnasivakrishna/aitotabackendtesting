@@ -1,4 +1,4 @@
-const { getProducer, recreateProducer } = require('../config/kafka');
+const { getProducer, recreateProducer, ensureTopics } = require('../config/kafka');
 
 async function sendWithRetry(topic, messages, attempts = 2) {
   let lastErr = null;
@@ -9,6 +9,10 @@ async function sendWithRetry(topic, messages, attempts = 2) {
       return;
     } catch (e) {
       lastErr = e;
+      if (i === 0) {
+        // On first failure, ensure topics exist
+        await ensureTopics([topic]);
+      }
       // If closed connection or network, recreate producer and retry once
       try {
         await recreateProducer();

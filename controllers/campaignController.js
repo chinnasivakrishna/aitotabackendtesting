@@ -1,7 +1,12 @@
 const orchestrator = require('../services/campaignOrchestrator');
 exports.start = async (req, res, next) => {
-  try { await orchestrator.startCampaign(req.params.id, req.body); res.json({ success: true }); }
-  catch (err) { next(err); }
+  try {
+    // Fire-and-forget to avoid gateway timeout; orchestration runs in background
+    orchestrator.startCampaign(req.params.id, req.body).catch(err => {
+      console.error('Campaign start failed:', err?.message || err);
+    });
+    res.status(202).json({ success: true, started: true });
+  } catch (err) { next(err); }
 };
 exports.stop = async (req, res, next) => {
   try { await orchestrator.stopCampaign(req.params.id); res.json({ success: true }); }
