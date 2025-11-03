@@ -23,7 +23,19 @@ exports.startCampaign = async (campaignId, { n, g, r, mode }) => {
   if (!campaign) throw new Error('Not found');
   await updateCampaignStatus(campaign, 'start');
   broadcastCampaign(campaign, 'start');
-  const agent = await Agent.findOne({ agentId: campaign.agent });
+  // Resolve agent reference: campaign.agent is an array of strings per schema
+  const agentRef = Array.isArray(campaign.agent) ? (campaign.agent[0] || null) : campaign.agent;
+  let agent = null;
+  if (agentRef) {
+    // Try by Mongo _id first, then by custom agentId field
+    agent = await Agent.findById(agentRef).lean();
+    if (!agent) {
+      agent = await Agent.findOne({ agentId: agentRef }).lean();
+    }
+  }
+  if (!agent) {
+    throw new Error('Agent not found for campaign. Please ensure campaign.agent contains a valid Agent ID or agentId');
+  }
 
   // Batch contacts processing for N-G-R
   const contacts = campaign.contacts;
@@ -64,9 +76,10 @@ async function handleCall(campaign, contact, agent) {
   if (!log) status = "notconnected";
   else if (log.isActive) status = "ongoing";
   else status = "completed";
-  campaign.detailedCalls.push({
+  // Persist under the defined `details` array in Campaign schema
+  campaign.details.push({
     uniqueId: uniqueid,
-    contactId: contact.id,
+    contactId: contact._id || contact.id,
     time: new Date(),
     status,
     runId: campaign._id.toString(),
