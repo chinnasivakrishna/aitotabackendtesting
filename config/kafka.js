@@ -1,5 +1,5 @@
 const { Kafka } = require('kafkajs');
-const { awsIamAuthenticator } = require('@jm18457/kafkajs-msk-iam-authentication');
+const { awsIamAuthenticator, Type: AWS_MSK_IAM } = require('@jm18457/kafkajs-msk-iam-authentication-mechanism');
 
 const brokers = (process.env.KAFKA_BROKER || '')
   .split(',')
@@ -11,8 +11,8 @@ const kafka = new Kafka({
   brokers,
   ssl: true,
   sasl: {
-    mechanism: 'aws',
-    authenticationProvider: awsIamAuthenticator,
+    mechanism: AWS_MSK_IAM,
+    authenticationProvider: awsIamAuthenticator({ region: process.env.AWS_REGION || 'ap-south-1' }),
   },
 });
 
