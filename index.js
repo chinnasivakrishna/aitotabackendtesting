@@ -5,7 +5,6 @@ const connectDB = require('./config/db');
 const axios = require('axios');
 const http = require('http');
 const { Kafka } = require('kafkajs');
-const { awsIamAuthenticator, Type: AWS_MSK_IAM } = require('@jm18457/kafkajs-msk-iam-authentication-mechanism');
 const VoiceChatWebSocketServer = require('./websocketServer');
 const superadminRoutes = require('./routes/superadminroutes')
 const adminRoutes = require('./routes/adminroutes');
@@ -1714,35 +1713,27 @@ connectDB().then(async () => {
         // Optional: quick MSK IAM connectivity test (non-blocking)
         try {
             const brokers = process.env.KAFKA_BROKERS ? process.env.KAFKA_BROKERS.split(',').map(b => b.trim()).filter(Boolean) : [];
-          console.log('🧩 Kafka config:', {
-                region: process.env.KAFKA_REGION || process.env.AWS_REGION || 'ap-south-1',
-              clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
-              brokers
-          });
+            console.log('🧩 Kafka config:', { clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1', brokers });
           if (brokers.length) {
-              console.log('🔎 Attempting Kafka IAM connect test...');
+                console.log('🔎 Attempting Kafka TLS connect test (no SASL/IAM)...');
                 const kafka = new Kafka({
                   clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
                   brokers,
-                  ssl: true,
-                  sasl: {
-                        mechanism: 'aws',
-                        authenticationProvider: awsIamAuthenticator({ region: process.env.KAFKA_REGION || process.env.AWS_REGION || 'ap-south-1' })
-                  }
+                    ssl: true
               });
               const testProducer = kafka.producer();
               await testProducer.connect();
-              console.log('✅ Kafka MSK IAM: Connected successfully ✅');
+                console.log('✅ Kafka TLS: Connected successfully ✅');
       
               // ✅ Try sending a test message
               await testProducer.send({
                   topic: 'test-topic',
                   messages: [{ key: 'test', value: 'Kafka IAM connection successful!' }],
               });
-              console.log('📨 Kafka test message sent successfully!');
+                console.log('📨 Kafka test message sent successfully!');
       
               await testProducer.disconnect();
-              console.log('🔌 Kafka MSK IAM: Disconnected (test complete)');
+                console.log('🔌 Kafka TLS: Disconnected (test complete)');
           } else {
               console.warn('⚠️ Kafka test skipped: KAFKA_BROKER env not set');
           }
