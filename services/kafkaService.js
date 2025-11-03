@@ -16,11 +16,16 @@ exports.send = async (topic, message) => {
       messages: [{ value: JSON.stringify(message) }]
     });
   } catch (err) {
-    // Attempt one reconnect and retry on disconnect errors
-    await ensureConnected();
-    await producer.send({
-      topic,
-      messages: [{ value: JSON.stringify(message) }]
-    });
+    try {
+      // Attempt one reconnect and retry on disconnect errors
+      await ensureConnected();
+      await producer.send({
+        topic,
+        messages: [{ value: JSON.stringify(message) }]
+      });
+    } catch (err2) {
+      // Log and continue without throwing to avoid breaking campaign flow
+      console.warn('[kafka] send failed after retry:', err2?.message || err2);
+    }
   }
 };

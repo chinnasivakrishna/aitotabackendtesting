@@ -72,8 +72,9 @@ async function handleCall(campaign, contact, agent) {
     await new Promise(res => setTimeout(res, 2000));
     waited += 2000;
   }
-  let status = "completed";
+  let status = "ringing";
   if (log && log.isActive) status = "ongoing";
+  else if (log && !log.isActive) status = "completed";
   // Persist under the defined `details` array in Campaign schema
   const detail = {
     uniqueId: uniqueid,
@@ -85,8 +86,14 @@ async function handleCall(campaign, contact, agent) {
   if (log && log.leadStatus) {
     detail.leadStatus = log.leadStatus;
   }
-  campaign.details.push(detail);
-  await campaign.save();
+  await Campaign.findByIdAndUpdate(
+    campaign._id,
+    {
+      $push: { details: detail },
+      $set: { updatedAt: new Date() }
+    },
+    { new: false }
+  );
   kafkaService.send('call-status', { campaignId: campaign._id, uniqueid, status });
   wsServer.broadcastCallEvent(campaign._id, uniqueid, status, log);
 }
