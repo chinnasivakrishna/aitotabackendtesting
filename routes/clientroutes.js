@@ -7,7 +7,7 @@ const { verifyGoogleToken } = require('../middlewares/googleAuth');
 const Client = require("../models/Client")
 const ClientApiService = require("../services/ClientApiService")
 const { generateClientApiKey, getActiveClientApiKey, copyActiveClientApiKey } = require("../controllers/clientApiKeyController")
-const { getobject, getobjectFor, getobjectForWithRegion } = require('../utils/s3')
+const { getobject } = require('../utils/s3')
 const Agent = require('../models/Agent');
 const VoiceService = require('../services/voiceService');
 const voiceService = new VoiceService();
@@ -42,7 +42,6 @@ const {
   resetCircuitBreakers,
   getSafeLimits
 } = require('../services/campaignCallingService');
-const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 
 
 const clientApiService = new ClientApiService()
@@ -242,184 +241,6 @@ router.get('/profile', authMiddleware, getClientProfile);
 // Knowledge Base uploads and file access
 router.get('/upload-url-knowledge-base', getUploadUrlKnowledgeBase);
 router.get('/file-url', getFileUrlByKey);
-
-// Stream call audio via backend proxy to avoid S3 CORS/signature issues
-router.get('/campaigns/:id/call-audio', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { documentId } = req.query;
-    if (!documentId) return res.status(400).json({ success: false, error: 'documentId is required' });
-
-    // Find CallLog by uniqueid first (more reliable)
-    let latest = await CallLog.findOne({
-      'metadata.customParams.uniqueid': String(documentId)
-    }).sort({ createdAt: -1 }).lean();
-
-    // If not found, try with campaignId filter as well
-    if (!latest) {
-      try {
-        const campaignIdObj = new mongoose.Types.ObjectId(id);
-        latest = await CallLog.findOne({
-          campaignId: campaignIdObj,
-          'metadata.customParams.uniqueid': String(documentId)
-        }).sort({ createdAt: -1 }).lean();
-      } catch (e) {
-        // If ObjectId conversion fails, try string match
-        latest = await CallLog.findOne({
-          campaignId: id,
-          'metadata.customParams.uniqueid': String(documentId)
-        }).sort({ createdAt: -1 }).lean();
-      }
-    }
-
-    if (!latest || !latest.audioUrl) {
-      console.log('Audio not found:', { documentId, campaignId: id, found: !!latest });
-      return res.status(404).json({ success: false, error: 'Recording not found' });
-    }
-
-    let bucket = process.env.AWS_BUCKET_NAME;
-    let key;
-    let region = process.env.AWS_REGION;
-    try {
-      const u = new URL(latest.audioUrl);
-      key = decodeURIComponent(u.pathname.replace(/^\//, ''));
-      const host = String(u.hostname || '');
-      if (host.includes('.s3')) {
-        bucket = host.split('.s3')[0];
-        if (host.includes('.s3.')) {
-          region = host.split('.s3.')[1].split('.')[0] || region;
-        }
-      }
-    } catch (_) {
-      key = latest.audioUrl; // treat as raw key
-    }
-
-    const client = new S3Client({
-      region: region || process.env.AWS_REGION,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-      },
-    });
-    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-    const s3Resp = await client.send(command);
-
-    // Default headers for audio
-    res.setHeader('Content-Type', s3Resp.ContentType || 'audio/wav');
-    if (s3Resp.ContentLength) res.setHeader('Content-Length', String(s3Resp.ContentLength));
-    // Allow range requests for audio seeking
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=0, no-cache, no-store');
-
-    if (s3Resp.Body && typeof s3Resp.Body.pipe === 'function') {
-      s3Resp.Body.pipe(res);
-    } else {
-      res.status(500).json({ success: false, error: 'Failed to stream audio' });
-    }
-  } catch (error) {
-    console.error('Audio proxy error:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch audio' });
-  }
-});
-
-// Stream agent call audio via backend proxy to avoid S3 CORS/signature issues
-// Note: This route accepts token from query parameter for audio element compatibility
-router.get('/agents/:id/call-audio', async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { callLogId, token } = req.query;
-    if (!callLogId) return res.status(400).json({ success: false, error: 'callLogId is required' });
-
-    // Extract clientId from token (query param or header)
-    let clientId = null;
-    const authHeader = req.headers.authorization;
-    const authToken = token || (authHeader && authHeader.startsWith('Bearer') ? authHeader.split(' ')[1] : null);
-    
-    if (authToken) {
-      try {
-        const decoded = jwt.verify(authToken, process.env.JWT_SECRET);
-        if (decoded.userType === 'client' && decoded.id) {
-          clientId = decoded.id;
-        }
-      } catch (tokenError) {
-        // Token verification failed, will validate via callLog ownership instead
-      }
-    }
-
-    // Find CallLog by callLogId and agentId
-    const callLog = await CallLog.findOne({
-      _id: callLogId,
-      agentId: id
-    }).lean();
-
-    if (!callLog || !callLog.audioUrl) {
-      console.log('Audio not found:', { callLogId, agentId: id, found: !!callLog });
-      return res.status(404).json({ success: false, error: 'Recording not found' });
-    }
-
-    // Validate ownership: if we have clientId from token, verify it matches
-    if (clientId && callLog.clientId !== clientId) {
-      return res.status(403).json({ success: false, error: 'Access denied' });
-    }
-
-    // If no token but we found the callLog, validate agent belongs to the callLog's client
-    if (!clientId) {
-      const agent = await Agent.findOne({ _id: id, clientId: callLog.clientId }).lean();
-      if (!agent) {
-        return res.status(403).json({ success: false, error: 'Access denied' });
-      }
-    } else {
-      // Validate agent exists and belongs to client
-      const agent = await Agent.findOne({ _id: id, clientId: clientId }).lean();
-      if (!agent) {
-        return res.status(404).json({ success: false, error: 'Agent not found' });
-      }
-    }
-
-    let bucket = process.env.AWS_BUCKET_NAME;
-    let key;
-    let region = process.env.AWS_REGION;
-    try {
-      const u = new URL(callLog.audioUrl);
-      key = decodeURIComponent(u.pathname.replace(/^\//, ''));
-      const host = String(u.hostname || '');
-      if (host.includes('.s3')) {
-        bucket = host.split('.s3')[0];
-        if (host.includes('.s3.')) {
-          region = host.split('.s3.')[1].split('.')[0] || region;
-        }
-      }
-    } catch (_) {
-      key = callLog.audioUrl; // treat as raw key
-    }
-
-    const client = new S3Client({
-      region: region || process.env.AWS_REGION,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-      },
-    });
-    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
-    const s3Resp = await client.send(command);
-
-    // Default headers for audio
-    res.setHeader('Content-Type', s3Resp.ContentType || 'audio/wav');
-    if (s3Resp.ContentLength) res.setHeader('Content-Length', String(s3Resp.ContentLength));
-    // Allow range requests for audio seeking
-    res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=0, no-cache, no-store');
-
-    if (s3Resp.Body && typeof s3Resp.Body.pipe === 'function') {
-      s3Resp.Body.pipe(res);
-    } else {
-      res.status(500).json({ success: false, error: 'Failed to stream audio' });
-    }
-  } catch (error) {
-    console.error('Agent audio proxy error:', error);
-    res.status(500).json({ success: false, error: 'Failed to fetch audio' });
-  }
-});
 
 // Knowledge Base CRUD operations
 router.post('/knowledge-base', authMiddleware, createKnowledgeItem);
@@ -756,8 +577,7 @@ router.post('/campaigns/:id/save-run', extractClientId, async (req, res) => {
             contactId: detail.contactId || '',
             time: detail.time || '',
             status,
-            duration,
-            audioUrl: log?.audioUrl || null
+            duration
           });
         }
 
@@ -3417,7 +3237,7 @@ router.get('/campaigns/:id/call-logs-dashboard', extractClientId, async (req, re
         return res.status(404).json({ success: false, error: 'Document ID not found in this campaign' });
       }
 
-      let logsByDoc = await CallLog.find({
+      const logsByDoc = await CallLog.find({
         clientId: req.clientId,
         campaignId: campaign._id,
         'metadata.customParams.uniqueid': documentId
@@ -3426,18 +3246,6 @@ router.get('/campaigns/:id/call-logs-dashboard', extractClientId, async (req, re
         .populate('campaignId', 'name description')
         .populate('agentId', 'agentName')
         .lean();
-
-      // Replace with backend proxy URL to avoid S3 CORS/signature issues
-      try {
-        const base = `${req.protocol}://${req.get('host')}`;
-        logsByDoc = (logsByDoc || []).map((l) => {
-          const uid = l?.metadata?.customParams?.uniqueid;
-          if (uid) {
-            l.audioUrl = `${base}/api/v1/client/campaigns/${campaign._id}/call-audio?documentId=${encodeURIComponent(uid)}`;
-          }
-          return l;
-        });
-      } catch (_) {}
 
       return res.json({
         success: true,
@@ -3501,19 +3309,7 @@ router.get('/campaigns/:id/call-logs-dashboard', extractClientId, async (req, re
       metadata: { customParams: { uniqueid: uid }, isActive: false }
     }));
 
-    let allLogs = [...logs, ...placeholderLogs];
-
-    // Use backend proxy URL to avoid S3 CORS/signature issues
-    try {
-      const base = `${req.protocol}://${req.get('host')}`;
-      allLogs = (allLogs || []).map((l) => {
-        const uid = l?.metadata?.customParams?.uniqueid;
-        if (uid) {
-          l.audioUrl = `${base}/api/v1/client/campaigns/${campaign._id}/call-audio?documentId=${encodeURIComponent(uid)}`;
-        }
-        return l;
-      });
-    } catch (_) {}
+    const allLogs = [...logs, ...placeholderLogs];
 
     return res.json({
       success: true,
@@ -3562,15 +3358,67 @@ router.get('/campaigns/:id/contacts', extractClientId, async (req, res) => {
 router.post('/campaigns/:id/contacts', extractClientId, async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, phone, email } = req.body;
-
-    if (!name || !phone) {
-      return res.status(400).json({ success: false, error: 'Name and phone are required' });
-    }
+    const { name, phone, email, contacts, replace } = req.body;
 
     const campaign = await Campaign.findOne({ _id: id, clientId: req.clientId });
     if (!campaign) {
       return res.status(404).json({ success: false, error: 'Campaign not found' });
+    }
+
+    // Handle multiple contacts (for redial functionality)
+    if (contacts && Array.isArray(contacts)) {
+      let addedContacts = [];
+      let skippedContacts = [];
+
+      // If replace is true, clear existing contacts first
+      if (replace) {
+        campaign.contacts = [];
+      }
+
+      for (const contact of contacts) {
+        if (!contact.phone) {
+          skippedContacts.push({ contact, reason: 'Missing phone number' });
+          continue;
+        }
+
+        // Check if phone number already exists in campaign contacts
+        const existingContact = campaign.contacts.find(c => c.phone === contact.phone);
+        if (existingContact) {
+          skippedContacts.push({ contact, reason: 'Phone number already exists' });
+          continue;
+        }
+
+        // Add new contact
+        const newContact = {
+          _id: new mongoose.Types.ObjectId(),
+          name: contact.name || '',
+          phone: contact.phone,
+          email: contact.email || '',
+          bookmarked: false,
+          addedAt: new Date()
+        };
+
+        campaign.contacts.push(newContact);
+        addedContacts.push(newContact);
+      }
+
+      await campaign.save();
+
+      return res.json({
+        success: true,
+        data: {
+          added: addedContacts.length,
+          skipped: skippedContacts.length,
+          contacts: addedContacts,
+          skippedContacts
+        },
+        message: `Added ${addedContacts.length} contacts successfully${skippedContacts.length > 0 ? `, skipped ${skippedContacts.length} duplicates` : ''}`
+      });
+    }
+
+    // Handle single contact (original functionality)
+    if (!name || !phone) {
+      return res.status(400).json({ success: false, error: 'Name and phone are required' });
     }
 
     // Check if phone number already exists in campaign contacts
@@ -3944,9 +3792,18 @@ router.get('/campaigns/:id/merged-calls', extractClientId, async (req, res) => {
 
     // 2. Get all uniqueIds
     const allUniqueIds = details.map(d => d.uniqueId).filter(Boolean);
+    console.log(`🔍 MERGED CALLS: Details array length: ${details.length}`);
+    console.log(`🔍 MERGED CALLS: Sample detail:`, details[0]);
 
     // Build a contacts map for O(1) lookups
     const contactsMap = new Map((campaign.contacts || []).map(c => [String(c._id), c]));
+    console.log(`🔍 MERGED CALLS: Campaign has ${campaign.contacts?.length || 0} contacts`);
+    console.log(`🔍 MERGED CALLS: Contacts map keys:`, Array.from(contactsMap.keys()));
+    console.log(`🔍 MERGED CALLS: Sample contact:`, campaign.contacts?.[0]);
+    
+    // Also create a map by phone number for fallback lookup
+    const contactsByPhone = new Map((campaign.contacts || []).map(c => [String(c.phone), c]));
+    console.log(`🔍 MERGED CALLS: Contacts by phone keys:`, Array.from(contactsByPhone.keys()));
 
     // 3. Aggregation to fetch latest log per uniqueId, compute duration, isOngoing,
     //    and sum transcript counts across all logs (fallback to transcript array size)
@@ -3975,7 +3832,6 @@ router.get('/campaigns/:id/merged-calls', extractClientId, async (req, res) => {
             updatedAt: '$latest.updatedAt',
             time: '$latest.time',
             duration: '$latest.duration',
-            audioUrl: '$latest.audioUrl',
             status: '$latest.status',
             leadStatus: '$latest.leadStatus',
             mobile: '$latest.mobile',
@@ -4082,7 +3938,6 @@ router.get('/campaigns/:id/merged-calls', extractClientId, async (req, res) => {
           time: detail.time || detail.createdAt,
           status: callStatus,
           duration: computedDuration,
-          audioUrl: log.audioUrl || null,
           isMissed: false,
           isOngoing: isOngoingFlag,
           transcriptCount,
@@ -4107,7 +3962,14 @@ router.get('/campaigns/:id/merged-calls', extractClientId, async (req, res) => {
       if (!uniqueId || processedUniqueIds.has(uniqueId)) continue;
 
       // No CallLog found for this uniqueId yet – fall back to campaign.details status
-      const contact = contactsMap.get(String(detail.contactId));
+      let contact = contactsMap.get(String(detail.contactId));
+      console.log(`🔍 MERGED CALLS: Looking up contactId ${detail.contactId}, found:`, contact ? 'YES' : 'NO');
+      
+      // If contact not found by ID, try to find by phone number from the detail
+      if (!contact && detail.phone) {
+        contact = contactsByPhone.get(String(detail.phone));
+        console.log(`🔍 MERGED CALLS: Fallback lookup by phone ${detail.phone}, found:`, contact ? 'YES' : 'NO');
+      }
       // Default: ringing immediately after initiation until timeout threshold
       let fallbackStatus = 'ringing';
 
@@ -4139,12 +4001,12 @@ router.get('/campaigns/:id/merged-calls', extractClientId, async (req, res) => {
       })();
       // No extra DB lookup here; keep computedDetailDuration as-is to avoid N+1 queries
       // Build a clean display name from contact when logs are absent
-      const fallbackNumber2 = contact?.phone || null;
-      const displayName2 = sanitizeName(contact?.name || '', fallbackNumber2) || null;
+      const fallbackNumber2 = contact?.phone || detail.phone || null;
+      const displayName2 = sanitizeName(contact?.name || detail.name || '', fallbackNumber2) || null;
 
       mergedCalls.push({
         documentId: uniqueId,
-        number: contact?.phone || null,
+        number: contact?.phone || detail.phone || null,
         name: displayName2,
         leadStatus: 'not_connected',
         contactId: detail.contactId,
@@ -4181,19 +4043,7 @@ router.get('/campaigns/:id/merged-calls', extractClientId, async (req, res) => {
     const totalItems = mergedCalls.length;
     const totalPages = Math.ceil(totalItems / limit);
     const skip = (page - 1) * limit;
-    let pagedCalls = mergedCalls.slice(skip, skip + limit);
-
-    // Use backend proxy URL to avoid S3 CORS/signature issues
-    try {
-      const base = `${req.protocol}://${req.get('host')}`;
-      pagedCalls = (pagedCalls || []).map((c) => {
-        const uid = c?.documentId;
-        if (uid) {
-          c.audioUrl = `${base}/api/v1/client/campaigns/${campaign._id}/call-audio?documentId=${encodeURIComponent(uid)}`;
-        }
-        return c;
-      });
-    } catch (_) {}
+    const pagedCalls = mergedCalls.slice(skip, skip + limit);
 
 
     // Calculate totals from all mergedCalls (before pagination)
@@ -4661,6 +4511,17 @@ router.post('/campaigns/:id/start-calling', extractClientId, async (req, res) =>
     const runId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     startCampaignCalling(campaign, agentId, apiKey, delayBetweenCalls, req.clientId, runId, agentConfig);
 
+    // Telegram alert for campaign start
+     try {
+      const { sendCampaignStartAlert } = require('../utils/telegramAlert');
+      const client = await Client.findById(req.clientId).lean();
+      await sendCampaignStartAlert({
+        campaignName: campaign.name,
+        clientName: client?.name || client?.businessName || client?.email || 'Unknown Client',
+        mode: 'parallel'
+      });
+    } catch (_) {}
+
     res.json({
       success: true,
       message: 'Campaign calling started',
@@ -5021,6 +4882,117 @@ router.post('/calls/single', extractClientId, async (req, res) => {
   }
 });
 
+// Terminate an individual call
+router.post('/campaigns/terminate-call', extractClientId, async (req, res) => {
+  try {
+    const { uniqueId, callId, agentId } = req.body;
+    const clientId = req.clientId;
+
+    if (!uniqueId) {
+      return res.status(400).json({
+        success: false,
+        message: 'uniqueId is required'
+      });
+    }
+
+    // Find the call log
+    const CallLog = require('../models/CallLog');
+    const callLog = await CallLog.findOne({ 
+      'metadata.customParams.uniqueid': uniqueId,
+      clientId: clientId 
+    }).sort({ createdAt: -1 });
+
+    if (!callLog) {
+      return res.status(404).json({
+        success: false,
+        message: 'Call not found'
+      });
+    }
+
+    // Get agent for termination
+    let agent = null;
+    if (agentId) {
+      const Agent = require('../models/Agent');
+      agent = await Agent.findById(agentId);
+    }
+
+    // Determine provider and terminate
+    const hasTwilio = !!(callLog.metadata?.accountSid || callLog.metadata?.twilio?.accountSid);
+    const hasStreamOnly = !!(callLog.streamSid || callLog.callSid);
+    
+    if (hasTwilio || hasStreamOnly) {
+      // CZENTRIX termination
+      const terminationPayload = {
+        stop: { 
+          accountSid: callLog.metadata?.accountSid || callLog.metadata?.twilio?.accountSid,
+          callSid: callLog.callSid || callLog.streamSid 
+        }
+      };
+
+      const axios = require('axios');
+      const resp = await axios.post('https://test.aitota.com/api/calls/terminate', terminationPayload, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      console.log(`✅ CALL TERMINATED: ${uniqueId} - CZENTRIX`);
+    } else {
+      // SANPBX termination
+      if (!agent) {
+        return res.status(400).json({
+          success: false,
+          message: 'Agent is required for SANPBX termination'
+        });
+      }
+
+      const callIdToUse = callId || callLog.metadata?.callid || callLog.externalResponse?.callid;
+      if (!callIdToUse) {
+        return res.status(400).json({
+          success: false,
+          message: 'Call ID is required for SANPBX termination'
+        });
+      }
+
+      const axios = require('axios');
+      const accessToken = agent.accessToken;
+      const accessKey = agent.accessKey;
+
+      // Generate API token
+      const tokenUrl = 'https://clouduat28.sansoftwares.com/pbxadmin/sanpbxapi/gentoken';
+      const tokenResp = await axios.post(tokenUrl, { access_key: accessKey }, { 
+        headers: { Accesstoken: accessToken } 
+      });
+      const apiToken = tokenResp?.data?.Apitoken;
+
+      if (!apiToken) {
+        return res.status(400).json({
+          success: false,
+          message: 'Failed to get SANPBX API token'
+        });
+      }
+
+      // Terminate call
+      const terminateUrl = 'https://clouduat28.sansoftwares.com/pbxadmin/sanpbxapi/terminatecall';
+      const terminateResp = await axios.post(terminateUrl, { callid: callIdToUse }, {
+        headers: { Accesstoken: apiToken }
+      });
+
+      console.log(`✅ CALL TERMINATED: ${uniqueId} - SANPBX`);
+    }
+
+    res.json({
+      success: true,
+      message: 'Call terminated successfully'
+    });
+
+  } catch (error) {
+    console.error('Error terminating call:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to terminate call: ' + error.message
+    });
+  }
+});
+
 // Stop campaign calling process
 router.post('/campaigns/:id/stop-calling', extractClientId, async (req, res) => {
   try {
@@ -5062,7 +5034,7 @@ router.post('/campaigns/:id/stop-calling', extractClientId, async (req, res) => 
         const contactsById = new Map((campaign.contacts || []).map(c => [String(c._id || ''), c]));
         const runDetails = campaignDetails.filter(d => d && d.runId === runId);
         
-        let contacts = runDetails.map(d => {
+        const contacts = runDetails.map(d => {
           const contact = contactsById.get(String(d.contactId || ''));
           const callLog = callLogs.find(log => log.metadata?.customParams?.uniqueid === d.uniqueId);
           
@@ -5075,24 +5047,11 @@ router.post('/campaigns/:id/stop-calling', extractClientId, async (req, res) => 
             time: d.time ? d.time.toISOString() : new Date().toISOString(),
             status: d.status || 'completed',
             duration: d.callDuration || 0,
-            audioUrl: callLog?.audioUrl || null,
             transcriptCount: callLog?.transcriptCount || 0,
             whatsappMessageSent: callLog?.whatsappMessageSent || false,
             whatsappRequested: callLog?.whatsappRequested || false
           };
         });
-
-        // Replace with backend proxy URL to avoid S3 CORS/signature issues
-        try {
-          const base = `${req.protocol}://${req.get('host')}`;
-          contacts = (contacts || []).map((c) => {
-            const uid = c?.documentId;
-            if (uid) {
-              c.audioUrl = `${base}/api/v1/client/campaigns/${campaign._id}/call-audio?documentId=${encodeURIComponent(uid)}`;
-            }
-            return c;
-          });
-        } catch (_) {}
 
         // Calculate stats
         const totalContacts = contacts.length;
@@ -6241,26 +6200,12 @@ router.get('/agents/:id/call-logs', extractClientId, async (req, res) => {
     const totalLogs = await CallLog.countDocuments(query);
     
     // Fetch call logs with pagination
-    let logs = await CallLog.find(query)
+    const logs = await CallLog.find(query)
       .sort({ time: -1 })
       .skip(skip)
       .limit(parseInt(limit))
       .populate('campaignId', 'name description')
       .lean();
-    
-    // Replace with backend proxy URL to avoid S3 CORS/signature issues
-    // Always generate proxy URL if we have a callLogId, even if audioUrl is empty (audio might be available)
-    try {
-      const base = `${req.protocol}://${req.get('host')}`;
-      logs = (logs || []).map((l) => {
-        if (l._id) {
-          // Generate proxy URL for all logs with an ID, regardless of whether audioUrl exists
-          // The proxy route will check if audio actually exists when requested
-          l.audioUrl = `${base}/api/v1/client/agents/${id}/call-audio?callLogId=${encodeURIComponent(l._id)}`;
-        }
-        return l;
-      });
-    } catch (_) {}
     
     // Calculate statistics
     const totalCalls = totalLogs;
@@ -8572,6 +8517,442 @@ router.post('/calls/validate', authMiddleware, async (req, res) => {
     return res.status(500).json({
       success: false,
       error: "System error occurred during validation. Please try again or contact support."
+    });
+  }
+});
+
+// Redial endpoints
+// Get campaign history for redial
+router.get('/campaigns/:campaignId/history', async (req, res) => {
+  try {
+    const { campaignId } = req.params;
+    const clientId = req.clientId;
+    
+    const CampaignHistory = require('../models/CampaignHistory');
+    const Campaign = require('../models/Campaign');
+    
+    // Verify campaign belongs to client
+    const campaign = await Campaign.findOne({ _id: campaignId, clientId });
+    if (!campaign) {
+      return res.status(404).json({
+        success: false,
+        message: 'Campaign not found'
+      });
+    }
+    
+    // Get campaign history
+    const history = await CampaignHistory.find({ campaignId })
+      .sort({ createdAt: -1 })
+      .lean();
+    
+    res.json({
+      success: true,
+      data: history
+    });
+  } catch (error) {
+    console.error('Error fetching campaign history for redial:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch campaign history'
+    });
+  }
+});
+
+// Get merged call history from multiple campaigns
+router.post('/campaigns/merged-history', async (req, res) => {
+  try {
+    const { campaignIds, statusFilter = 'all', page = 1, limit = 1000 } = req.body;
+    const clientId = req.clientId;
+    
+    if (!campaignIds || !Array.isArray(campaignIds) || campaignIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Campaign IDs are required'
+      });
+    }
+
+    const CampaignHistory = require('../models/CampaignHistory');
+    const Campaign = require('../models/Campaign');
+    
+    // Get campaign names for reference
+    const campaigns = await Campaign.find({ 
+      _id: { $in: campaignIds }, 
+      clientId 
+    }).select('name').lean();
+    
+    const campaignNameMap = {};
+    campaigns.forEach(campaign => {
+      campaignNameMap[campaign._id.toString()] = campaign.name;
+    });
+
+    // Fetch history from all selected campaigns
+    const historyPromises = campaignIds.map(async (campaignId) => {
+      try {
+        const history = await CampaignHistory.find({ campaignId })
+          .sort({ createdAt: -1 })
+          .lean();
+        
+        // Flatten contacts from all runs
+        const allContacts = [];
+        history.forEach(run => {
+          if (run.contacts && Array.isArray(run.contacts)) {
+            run.contacts.forEach(contact => {
+              allContacts.push({
+                ...contact,
+                campaignId: campaignId,
+                campaignName: campaignNameMap[campaignId] || 'Unknown Campaign',
+                runId: run.runId,
+                runStartTime: run.startTime,
+                runEndTime: run.endTime
+              });
+            });
+          }
+        });
+        
+        return allContacts;
+      } catch (error) {
+        console.error(`Error fetching history for campaign ${campaignId}:`, error);
+        return [];
+      }
+    });
+
+    const allHistory = await Promise.all(historyPromises);
+    const merged = allHistory.flat();
+    
+    // Remove duplicates based on phone number and timestamp
+    const uniqueHistory = merged.filter((item, index, self) => 
+      index === self.findIndex(t => 
+        t.number === item.number && 
+        t.time === item.time
+      )
+    );
+
+    // Apply status filter
+    let filteredHistory = uniqueHistory;
+    if (statusFilter === 'connected') {
+      filteredHistory = uniqueHistory.filter(item => 
+        item.leadStatus === 'connected' || 
+        item.status === 'connected' ||
+        ['vvi', 'maybe', 'enrolled', 'hot_followup', 'cold_followup', 'schedule'].includes(item.leadStatus)
+      );
+    } else if (statusFilter === 'not_connected') {
+      filteredHistory = uniqueHistory.filter(item => 
+        item.leadStatus === 'not_connected' || 
+        item.status === 'not_connected' ||
+        item.status === 'missed' ||
+        ['junk_lead', 'not_required', 'enrolled_other', 'decline', 'not_eligible', 'wrong_number'].includes(item.leadStatus)
+      );
+    }
+
+    // Apply pagination
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const paginatedHistory = filteredHistory.slice(startIndex, endIndex);
+
+    res.json({
+      success: true,
+      data: paginatedHistory,
+      pagination: {
+        total: filteredHistory.length,
+        page: parseInt(page),
+        limit: parseInt(limit),
+        pages: Math.ceil(filteredHistory.length / parseInt(limit))
+      },
+      filters: {
+        campaignIds,
+        statusFilter,
+        totalCampaigns: campaignIds.length
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching merged history:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch merged history'
+    });
+  }
+});
+
+// Bulk redial contacts
+router.post('/campaigns/redial', extractClientId, async (req, res) => {
+  try {
+    const { contacts, campaignId, createNewCampaign, campaignName, useOriginalAgent } = req.body;
+    const clientId = req.clientId;
+    
+    if (!contacts || !Array.isArray(contacts) || contacts.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Contacts are required for redial'
+      });
+    }
+
+    let targetCampaignId = campaignId;
+    let campaign = null;
+
+    // Always use the existing campaign for redial
+    const Campaign = require('../models/Campaign');
+    
+    // Use the existing campaign
+    if (campaignId) {
+      campaign = await Campaign.findById(campaignId);
+      if (campaign && campaign.clientId === clientId) {
+        console.log(`Using existing campaign for redial: ${campaign._id}`);
+        targetCampaignId = campaign._id;
+      } else {
+        return res.status(404).json({
+          success: false,
+          message: 'Campaign not found or does not belong to client'
+        });
+      }
+    } else {
+      // Use existing campaign
+      if (!campaignId) {
+        return res.status(400).json({
+          success: false,
+          message: 'Campaign ID is required'
+        });
+      }
+
+      const Campaign = require('../models/Campaign');
+      campaign = await Campaign.findById(campaignId);
+      if (!campaign || campaign.clientId !== clientId) {
+        return res.status(404).json({
+          success: false,
+          message: 'Campaign not found'
+        });
+      }
+    }
+
+    if (!campaign.agent || campaign.agent.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No agent assigned to campaign'
+      });
+    }
+
+    const agentId = campaign.agent[0];
+    const agent = await Agent.findById(agentId);
+    if (!agent) {
+      return res.status(404).json({
+        success: false,
+        message: 'Agent not found'
+      });
+    }
+
+    // Get client API key
+    const { getClientApiKey } = require('../services/campaignCallingService');
+    let apiKey = null;
+    
+    try {
+      apiKey = await getClientApiKey(clientId);
+      console.log(`API key found for client ${clientId}: ${apiKey ? 'Yes' : 'No'}`);
+    } catch (error) {
+      console.log(`Error getting API key for client ${clientId}:`, error.message);
+    }
+    
+    // Use fallback API key if client doesn't have one configured
+    if (!apiKey) {
+      apiKey = "629lXqsiDk85lfMub7RsN73u4741MlOl4Dv8kJE9"; // fallback API key
+      console.log(`Using fallback API key for client ${clientId}`);
+    }
+
+    // Create a temporary group with ONLY the selected contacts for the redial campaign
+    const Group = require('../models/Group');
+    const tempGroup = new Group({
+      name: `Redial Group - ${new Date().toLocaleDateString()}`,
+      description: `Temporary group for redial campaign with ${contacts.length} selected contacts`,
+      clientId: clientId,
+      contacts: contacts.map(contact => ({
+        _id: contact._id || contact.documentId,
+        name: contact.name || '',
+        phone: contact.number || contact.phone,
+        email: contact.email || ''
+      })),
+      contactsCount: contacts.length,
+      createdAt: new Date()
+    });
+
+    const savedGroup = await tempGroup.save();
+    console.log(`Created temporary group for redial with ${contacts.length} selected contacts: ${savedGroup._id}`);
+
+    // Store original groups and contacts, then replace with only the redial contacts
+    const originalGroups = campaign.groups || [];
+    const originalContacts = campaign.contacts || [];
+    
+    // Update campaign with only the selected contacts for this redial session
+    const redialContacts = contacts.map(contact => ({
+      _id: contact._id || contact.documentId,
+      name: contact.name || '',
+      phone: contact.number || contact.phone,
+      email: contact.email || ''
+    }));
+    campaign.contacts = redialContacts;
+    campaign.groups = [savedGroup._id]; // Only use the redial group
+    await campaign.save();
+    console.log(`Temporarily replaced campaign with ${contacts.length} selected contacts only`);
+
+    // Determine calling mode based on agent configuration
+    let callingMode = 'serial'; // Default
+    
+    try {
+      const agentConfig = await AgentConfig.findOne({ agentId: agentId });
+      if (agentConfig && agentConfig.mode) {
+        callingMode = agentConfig.mode;
+        console.log(`Agent ${agentId} configured for ${callingMode} mode`);
+      }
+    } catch (error) {
+      console.log(`Could not fetch agent config, using default serial mode: ${error.message}`);
+    }
+
+    // Start the campaign using the appropriate calling method
+    let runId = null;
+    let campaignStarted = false;
+
+    if (callingMode === 'serial') {
+      // Start series calling
+      console.log(`Starting series redial campaign for ${contacts.length} selected contacts`);
+      console.log(`Campaign groups before series start:`, campaign.groups);
+      const seriesResponse = await fetch(`${req.protocol}://${req.get('host')}/api/v1/client/series-campaign/start`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': req.headers.authorization
+        },
+        body: JSON.stringify({
+          campaignId: targetCampaignId,
+          agentId: agentId,
+          minDelayMs: 5000
+        })
+      });
+
+      if (seriesResponse.ok) {
+        const seriesData = await seriesResponse.json();
+        runId = seriesData?.status?.runId;
+        campaignStarted = true;
+        console.log(`Series redial campaign started with runId: ${runId}`);
+      }
+    } else {
+      // Start parallel calling
+      console.log(`Starting parallel redial campaign for ${contacts.length} selected contacts`);
+      console.log(`Campaign groups before parallel start:`, campaign.groups);
+      const parallelResponse = await fetch(`${req.protocol}://${req.get('host')}/api/v1/client/campaigns/${targetCampaignId}/start-calling`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': req.headers.authorization
+        },
+        body: JSON.stringify({
+          agentId: agentId,
+          delayBetweenCalls: 2000
+        })
+      });
+
+      if (parallelResponse.ok) {
+        const parallelData = await parallelResponse.json();
+        runId = parallelData?.data?.runId;
+        campaignStarted = true;
+        console.log(`Parallel redial campaign started with runId: ${runId}`);
+      }
+    }
+
+    if (!campaignStarted) {
+      // Restore original groups and contacts if campaign failed to start
+      campaign.groups = originalGroups;
+      campaign.contacts = originalContacts;
+      await campaign.save();
+      console.log(`Restored original groups and contacts after campaign start failure`);
+      
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to start redial campaign'
+      });
+    }
+
+    // Restore original groups and contacts after successful campaign start
+    campaign.groups = originalGroups;
+    campaign.contacts = originalContacts;
+    await campaign.save();
+    console.log(`Restored original groups and contacts after successful campaign start`);
+
+    // Save redial session to campaign history (new history entry in same campaign)
+    try {
+      const CampaignHistory = require('../models/CampaignHistory');
+      
+      // Get the next instance number for this campaign
+      const lastHistory = await CampaignHistory.findOne({ campaignId: targetCampaignId })
+        .sort({ instanceNumber: -1 })
+        .lean();
+      const nextInstanceNumber = (lastHistory?.instanceNumber || 0) + 1;
+      
+      const redialHistory = new CampaignHistory({
+        campaignId: targetCampaignId,
+        runId: runId,
+        instanceNumber: nextInstanceNumber,
+        startTime: new Date().toISOString(),
+        endTime: new Date().toISOString(),
+        runTime: {
+          hours: 0,
+          minutes: 0,
+          seconds: Math.floor((new Date() - new Date()) / 1000)
+        },
+        status: 'completed',
+        contacts: contacts.map(contact => ({
+          documentId: contact._id || contact.documentId,
+          number: contact.number || contact.phone,
+          name: contact.name || '',
+          leadStatus: 'not_connected', // Will be updated when call completes
+          contactId: contact._id || contact.documentId,
+          time: new Date().toISOString(),
+          status: 'ringing',
+          duration: 0,
+          transcriptCount: 0,
+          whatsappMessageSent: false,
+          whatsappRequested: false
+        })),
+        stats: {
+          totalContacts: contacts.length,
+          successfulCalls: successCount,
+          failedCalls: failureCount,
+          totalCallDuration: 0,
+          averageCallDuration: 0
+        },
+        batchInfo: {
+          batchNumber: 1,
+          totalBatches: 1,
+          isIntermediate: false
+        }
+      });
+
+      await redialHistory.save();
+      console.log(`✅ REDIAL: Created new campaign history entry #${nextInstanceNumber} for campaign ${targetCampaignId}`);
+    } catch (error) {
+      console.error('Error saving redial history:', error);
+    }
+
+    console.log(`🎯 Redial campaign started successfully with ${contacts.length} contacts`);
+    
+    res.json({
+      success: true,
+      message: `Redial started successfully with ${contacts.length} contacts in existing campaign.`,
+      data: {
+        runId: runId,
+        campaignId: targetCampaignId,
+        campaignName: campaign.name,
+        callingMode: callingMode,
+        totalContacts: contacts.length,
+        groupId: savedGroup._id,
+        usingExistingCampaign: true,
+        redirectToCampaign: false, // Don't redirect, stay on current page
+        newHistoryEntry: true // Indicates a new campaign history entry was created
+      }
+    });
+
+  } catch (error) {
+    console.error('Error in bulk redial:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to start redial process',
+      error: error.message
     });
   }
 });

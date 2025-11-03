@@ -4,7 +4,6 @@ const ApiKey = require('../models/ApiKey');
 const Agent = require('../models/Agent');
 const CallLog = require('../models/CallLog');
 const mongoose = require('mongoose');
-const { sendDetailedCampaignStartAlert, sendDetailedCampaignEndAlert } = require('../utils/telegramAlert');
 
 /**
  * Circuit Breaker Pattern for API calls
@@ -859,37 +858,6 @@ async function startCampaignCalling(campaign, agentId, apiKey, delayBetweenCalls
 
   campaignCallingProgress.set(campaignId, progress);
   activeCampaigns.set(campaignId, true);
-
-  // Send detailed campaign start telegram alert
-  try {
-    const Agent = require('../models/Agent');
-    const Client = require('../models/Client');
-    const Group = require('../models/Group');
-    const agent = await Agent.findById(agentId);
-    const client = await Client.findById(clientId);
-    // Resolve group name from campaign.groupIds[0]
-    let groupName = 'Default Group';
-    try {
-      const firstGroupId = Array.isArray(campaign.groupIds) && campaign.groupIds.length ? campaign.groupIds[0] : null;
-      if (firstGroupId) {
-        const groupDoc = await Group.findById(firstGroupId).lean();
-        groupName = groupDoc?.groupName || groupDoc?.name || groupDoc?.title || groupName;
-      }
-    } catch {}
-    
-    await sendDetailedCampaignStartAlert({
-      campaignName: campaign.name || 'Unnamed Campaign',
-      agentName: agent?.agentName || 'Unknown Agent',
-      groupName: groupName,
-      didNumber: agent?.didNumber || 'N/A',
-      totalContacts: campaign.contacts.length,
-      clientName: client?.name || client?.username || 'Unknown Client',
-      userEmail: client?.email || 'N/A',
-      mode: agentConfig?.mode || 'serial'
-    });
-  } catch (error) {
-    console.error('❌ Failed to send campaign start telegram alert:', error.message);
-  }
 
   // Determine calling strategy based on agent configuration
   if (agentConfig && agentConfig.mode === 'parallel' && agentConfig.items && agentConfig.items.length > 0) {
@@ -1953,57 +1921,6 @@ async function autoSaveCampaignRun(campaign, progress) {
     }
     campaign.history.push(historyEntry);
     await campaign.save();
-
-    // Send detailed campaign end telegram alert
-    try {
-      const Agent = require('../models/Agent');
-      const Client = require('../models/Client');
-      const Group = require('../models/Group');
-      // Resolve agent id from campaign (array) or fallback
-      const agentIdFromCampaign = Array.isArray(campaign.agent) && campaign.agent.length ? campaign.agent[0] : campaign.agentId;
-      const agent = agentIdFromCampaign ? await Agent.findById(agentIdFromCampaign) : null;
-      const client = campaign.clientId ? await Client.findById(campaign.clientId) : null;
-      // Resolve group name from campaign.groupIds[0]
-      let groupName = 'Default Group';
-      try {
-        const firstGroupId = Array.isArray(campaign.groupIds) && campaign.groupIds.length ? campaign.groupIds[0] : null;
-        if (firstGroupId) {
-          const groupDoc = await Group.findById(firstGroupId).lean();
-          groupName = groupDoc?.groupName || groupDoc?.name || groupDoc?.title || groupName;
-        }
-      } catch {}
-      
-      const connected = historyEntry.successfulCalls;
-      const missed = historyEntry.failedCalls;
-      const totalContacts = Array.isArray(campaign.contacts) ? campaign.contacts.length : (historyEntry.totalCalls || 0);
-      const connectedPercentage = totalContacts > 0 ? Math.round((connected / totalContacts) * 100) : 0;
-      
-      // Format duration as HH:MM:SS
-      const hours = Math.floor(runTime / 3600);
-      const minutes = Math.floor((runTime % 3600) / 60);
-      const seconds = runTime % 60;
-      const durationFormatted = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-      
-      await sendDetailedCampaignEndAlert({
-        campaignName: campaign.name || 'Unnamed Campaign',
-        runId: runId,
-        agentName: agent?.agentName || 'Unknown Agent',
-        groupName: groupName,
-        didNumber: agent?.didNumber || 'N/A',
-        totalContacts: totalContacts,
-        startTime: startTime,
-        endTime: endTime,
-        duration: durationFormatted,
-        connected: connected,
-        missed: missed,
-        connectedPercentage: connectedPercentage,
-        clientName: client?.name || client?.username || 'Unknown Client',
-        userEmail: client?.email || 'N/A',
-        mode: progress.callingMode || 'serial'
-      });
-    } catch (error) {
-      console.error('❌ Failed to send campaign end telegram alert:', error.message);
-    }
 
     console.log(`✅ AUTO-SAVE: Campaign run saved successfully for ${campaign._id}`);
   } catch (error) {

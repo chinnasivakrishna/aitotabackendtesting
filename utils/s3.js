@@ -55,48 +55,6 @@ const getobject = async (key) => {
   }
 };
 
-// Generate presigned URL for a specific bucket and key
-const getobjectFor = async (bucket, key) => {
-  try {
-    const command = new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      ResponseContentDisposition: 'inline',
-      ResponseContentType: key.endsWith('.txt') ? 'text/plain; charset=utf-8' : undefined,
-    });
-
-    const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 604800 });
-    return signedUrl;
-  } catch (error) {
-    console.error('Error generating get presigned URL for bucket:', error);
-    throw error;
-  }
-};
-
-// Generate presigned URL for a specific bucket and region
-const getobjectForWithRegion = async (bucket, key, region) => {
-  try {
-    const regionalClient = new S3Client({
-      region: region || process.env.AWS_REGION,
-      credentials: {
-        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-      },
-    });
-    const command = new GetObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      ResponseContentDisposition: 'inline',
-      ResponseContentType: key.endsWith('.txt') ? 'text/plain; charset=utf-8' : undefined,
-    });
-    const signedUrl = await getSignedUrl(regionalClient, command, { expiresIn: 604800 });
-    return signedUrl;
-  } catch (error) {
-    console.error('Error generating regional presigned URL:', error);
-    throw error;
-  }
-};
-
 const deleteObject = async (key) => {
   try {
     const command = new DeleteObjectCommand({
@@ -115,7 +73,5 @@ module.exports = {
   s3Client,
   putobject,
   getobject,
-  getobjectFor,
-  getobjectForWithRegion,
   deleteObject,
 };

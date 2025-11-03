@@ -439,62 +439,6 @@ async function runSeries({ campaignId, agentId, apiKey, clientId, minDelayMs = 4
     );
 
     console.log(`💾 SERIES: Auto-saved run to CampaignHistory (success=${successfulCalls}, failed=${failedCalls}) for campaign=${campaignId}`);
-    
-    // Send detailed campaign end telegram alert
-    try {
-      const { sendDetailedCampaignEndAlert } = require('../utils/telegramAlert');
-      const Agent = require('../models/Agent');
-      const Client = require('../models/Client');
-      const Group = require('../models/Group');
-      
-      // Resolve agent from campaign.agent[0] or fallback
-      const agentIdFromCampaign = Array.isArray(fresh.agent) && fresh.agent.length ? fresh.agent[0] : null;
-      const agent = agentIdFromCampaign ? await Agent.findById(agentIdFromCampaign).lean() : null;
-      
-      // Resolve client
-      const client = fresh.clientId ? await Client.findById(fresh.clientId).lean() : null;
-      
-      // Resolve group name from campaign.groupIds[0]
-      let groupName = 'Default Group';
-      try {
-        const firstGroupId = Array.isArray(fresh.groupIds) && fresh.groupIds.length ? fresh.groupIds[0] : null;
-        if (firstGroupId) {
-          const groupDoc = await Group.findById(firstGroupId).lean();
-          groupName = groupDoc?.groupName || groupDoc?.name || groupDoc?.title || groupName;
-        }
-      } catch {}
-      
-      const connected = successfulCalls;
-      const missed = failedCalls;
-      const connectedPercentage = totalContacts > 0 ? Math.round((connected / totalContacts) * 100) : 0;
-      
-      // Format duration as HH:MM:SS
-      const hours = Math.floor(elapsedSec / 3600);
-      const minutes = Math.floor((elapsedSec % 3600) / 60);
-      const seconds = elapsedSec % 60;
-      const durationFormatted = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-      
-      await sendDetailedCampaignEndAlert({
-        campaignName: fresh.name || 'Unnamed Campaign',
-        runId: runId,
-        agentName: agent?.agentName || 'Unknown Agent',
-        groupName: groupName,
-        didNumber: agent?.didNumber || 'N/A',
-        totalContacts: totalContacts,
-        startTime: startTime,
-        endTime: endTime,
-        duration: durationFormatted,
-        connected: connected,
-        missed: missed,
-        connectedPercentage: connectedPercentage,
-        clientName: client?.businessName || client?.name || client?.email || 'Unknown Client',
-        userEmail: client?.email || 'N/A',
-        mode: 'serial'
-      });
-    } catch (error) {
-      console.error('❌ Failed to send series campaign end telegram alert:', error.message);
-    }
-    
   } catch (e) {
     console.log(`⚠️ SERIES: Auto-save failed: ${e?.message || e}`);
   }
@@ -520,17 +464,12 @@ router.post('/start', async (req, res) => {
       sequentialRuns.delete(String(campaignId));
     }
 
-    // Start in background and Telegram alert
-    try {
-      const { sendDetailedCampaignStartAlert } = require('../utils/telegramAlert');
-      const Agent = require('../models/Agent');
-      const Client = require('../models/Client');
-      const Group = require('../models/Group');
-
+    // Start in background and telegrama alert
+            try {
+      const { sendCampaignStartAlert } = require('../utils/telegramAlert');
       const clientMongoId = req.clientId || clientId || null;
       const campaignDoc = await Campaign.findById(campaignId).lean();
-
-      // Resolve client doc robustly: try body -> campaign -> auth fallback
+      // Resolve client doc robustly: try _id, then userId, then from campaign
       let client = null;
       if (clientMongoId) {
         client = await Client.findById(clientMongoId).lean();
@@ -539,32 +478,13 @@ router.post('/start', async (req, res) => {
       if (!client && campaignDoc?.clientId) {
         try { client = await Client.findById(campaignDoc.clientId).lean(); } catch (_) {}
       }
+      // Final fallback: try current authenticated client's id (from middleware)
       if (!client && req.user?.userType === 'client' && req.user?.id) {
         try { client = await Client.findById(req.user.id).lean(); } catch (_) {}
       }
-
-      // Resolve agent (from body agentId or campaign.agent[0])
-      const resolvedAgentId = agentId || (Array.isArray(campaignDoc?.agent) && campaignDoc.agent.length ? campaignDoc.agent[0] : null);
-      const agent = resolvedAgentId ? await Agent.findById(resolvedAgentId).lean() : null;
-
-      // Resolve group name from campaign.groupIds[0]
-      let groupName = 'Default Group';
-      try {
-        const firstGroupId = Array.isArray(campaignDoc?.groupIds) && campaignDoc.groupIds.length ? campaignDoc.groupIds[0] : null;
-        if (firstGroupId) {
-          const groupDoc = await Group.findById(firstGroupId).lean();
-          groupName = groupDoc?.groupName || groupDoc?.name || groupDoc?.title || groupName;
-        }
-      } catch {}
-
-      await sendDetailedCampaignStartAlert({
+      await sendCampaignStartAlert({
         campaignName: campaignDoc?.name || String(campaignId),
-        agentName: agent?.agentName || 'Unknown Agent',
-        groupName: groupName,
-        didNumber: agent?.didNumber || 'N/A',
-        totalContacts: Array.isArray(campaignDoc?.contacts) ? campaignDoc.contacts.length : 0,
         clientName: client?.businessName || client?.name || client?.email || String(clientMongoId || campaignDoc?.clientId || ''),
-        userEmail: client?.email || 'N/A',
         mode: 'serial'
       });
     } catch (_) {}

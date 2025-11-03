@@ -16,7 +16,6 @@ const agentAccessRoutes = require('./routes/agentAccessRoutes')
 const makecallRoutes = require('./routes/makecallRoutes')
 const sttRoutes = require('./routes/sttRoutes')
 const dispositionRoutes = require('./routes/dispositionRoutes')
-const telegrambotRoutes = require('./routes/telegrambot')
 const Business = require('./models/MyBussiness');
 // const humanAgentRoutes = require('./routes/humanAgentRoutes');
 const { CLIENT_ID, CLIENT_SECRET, BASE_URL } = require('./config/cashfree');
@@ -25,7 +24,8 @@ const app = express();
 const Client = require("./models/Client");
 const Payment = require("./models/Payment");
 const server = http.createServer(app);
-// Campaign calling background services
+const campaignRoutes = require('./routes/campaignRoutes');
+const errorHandler = require('./utils/errorHandler');
 // Cashfree callback (return_url handler)
 
 // Import required modules (add these to your existing imports)
@@ -1187,6 +1187,7 @@ app.post('/api/v1/client/proxy/clicktobot', async (req, res) => {
     }
   });
 
+app.use('/api/campaigns', campaignRoutes);
 app.use('/api/v1/superadmin',superadminRoutes);
 app.use('/api/v1/admin',adminRoutes);
 app.use('/api/v1/client',clientRoutes);
@@ -1199,7 +1200,6 @@ app.use('/makecall', makecallRoutes);
 app.use('/api/v1/stt', sttRoutes);
 app.use('/api/v1/dispositions', dispositionRoutes);
 app.use('/api/v1/client/series-campaign', seriesCampaignRoutes);
-app.use('/api/v1/telegram', telegrambotRoutes);
 
 // Public API endpoint for business details (no authentication required)
 app.get('/api/v1/public/business/:identifier', async (req, res) => {

@@ -42,7 +42,6 @@ const CampaignHistorySchema = new mongoose.Schema({
         time: String,
         status: String,
         duration: Number,
-        audioUrl: String,
         transcriptCount: Number,
         whatsappMessageSent: Boolean,
         whatsappRequested: Boolean
