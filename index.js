@@ -1713,34 +1713,43 @@ connectDB().then(async () => {
     try {
         // Optional: quick MSK IAM connectivity test (non-blocking)
         try {
-            const brokers = (process.env.KAFKA_BROKER || '').split(',').map(b => b.trim()).filter(Boolean);
-            console.log('🧩 Kafka config:', {
-                region: process.env.AWS_REGION || 'ap-south-1',
-                clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
-                brokers
-            });
-            if (brokers.length) {
-                console.log('🔎 Attempting Kafka IAM connect test...');
-                const kafka = new Kafka({
-                    clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
-                    brokers,
-                    ssl: true,
-                    sasl: {
-                        mechanism: AWS_MSK_IAM,
-                        authenticationProvider: awsIamAuthenticator({ region: process.env.AWS_REGION || 'ap-south-1' })
-                    }
-                });
-                const testProducer = kafka.producer();
-                await testProducer.connect();
-                console.log('✅ Kafka MSK IAM: Connected');
-                await testProducer.disconnect();
-                console.log('🔌 Kafka MSK IAM: Disconnected (test complete)');
-            } else {
-                console.warn('⚠️ Kafka test skipped: KAFKA_BROKER env not set');
-            }
-        } catch (e) {
-            console.warn('⚠️ Kafka IAM connectivity test failed:', e && (e.stack || e.message || e));
-        }
+          const brokers = (process.env.KAFKA_BROKER || '').split(',').map(b => b.trim()).filter(Boolean);
+          console.log('🧩 Kafka config:', {
+              region: process.env.AWS_REGION || 'ap-south-1',
+              clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
+              brokers
+          });
+          if (brokers.length) {
+              console.log('🔎 Attempting Kafka IAM connect test...');
+              const kafka = new Kafka({
+                  clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
+                  brokers,
+                  ssl: true,
+                  sasl: {
+                      mechanism: AWS_MSK_IAM,
+                      authenticationProvider: awsIamAuthenticator({ region: process.env.AWS_REGION || 'ap-south-1' })
+                  }
+              });
+              const testProducer = kafka.producer();
+              await testProducer.connect();
+              console.log('✅ Kafka MSK IAM: Connected successfully ✅');
+      
+              // ✅ Try sending a test message
+              await testProducer.send({
+                  topic: 'test-topic',
+                  messages: [{ key: 'test', value: 'Kafka IAM connection successful!' }],
+              });
+              console.log('📨 Kafka test message sent successfully!');
+      
+              await testProducer.disconnect();
+              console.log('🔌 Kafka MSK IAM: Disconnected (test complete)');
+          } else {
+              console.warn('⚠️ Kafka test skipped: KAFKA_BROKER env not set');
+          }
+      } catch (e) {
+          console.warn('⚠️ Kafka IAM connectivity test failed:', e && (e.stack || e.message || e));
+      }
+      
         const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');
         await fixStuckCalls();
         console.log('✅ SERVER RESTART: Stuck calls check completed');
