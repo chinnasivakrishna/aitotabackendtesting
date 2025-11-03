@@ -1713,21 +1713,21 @@ connectDB().then(async () => {
     try {
         // Optional: quick MSK IAM connectivity test (non-blocking)
         try {
-          const brokers = (process.env.KAFKA_BROKER || '').split(',').map(b => b.trim()).filter(Boolean);
+            const brokers = process.env.KAFKA_BROKERS ? process.env.KAFKA_BROKERS.split(',').map(b => b.trim()).filter(Boolean) : [];
           console.log('🧩 Kafka config:', {
-              region: process.env.AWS_REGION || 'ap-south-1',
+                region: process.env.KAFKA_REGION || process.env.AWS_REGION || 'ap-south-1',
               clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
               brokers
           });
           if (brokers.length) {
               console.log('🔎 Attempting Kafka IAM connect test...');
-              const kafka = new Kafka({
+                const kafka = new Kafka({
                   clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
                   brokers,
                   ssl: true,
                   sasl: {
-                      mechanism: AWS_MSK_IAM,
-                      authenticationProvider: awsIamAuthenticator({ region: process.env.AWS_REGION || 'ap-south-1' })
+                        mechanism: 'aws',
+                        authenticationProvider: awsIamAuthenticator({ region: process.env.KAFKA_REGION || process.env.AWS_REGION || 'ap-south-1' })
                   }
               });
               const testProducer = kafka.producer();
