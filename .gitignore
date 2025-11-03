@@ -1,0 +1,14 @@
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+loginbackend/.env
+
+# Logs
+logs
+*.log
+
+# Build files
+dist/
+build/
