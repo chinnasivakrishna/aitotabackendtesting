@@ -2,22 +2,15 @@ const { Kafka, logLevel } = require('kafkajs');
 
 const brokers = process.env.KAFKA_BROKERS
   ? process.env.KAFKA_BROKERS.split(',').map(b => b.trim()).filter(Boolean)
-  : [];
+  : ['localhost:9092']; // default for your EC2 Kafka
 
-  const { MSKAuth } = require('@jm18457/kafkajs-msk-iam-authentication');
-  const AWS = require('aws-sdk');
-  
-  const kafka = new Kafka({
-    clientId: process.env.KAFKA_CLIENT_ID || 'democluster2',
-    brokers,
-    ssl: true,
-    sasl: {
-      mechanism: 'aws',
-      authenticationProvider: MSKAuth(AWS),
-    },
-    logLevel: logLevel.INFO,
-  });
-  
+const kafka = new Kafka({
+  clientId: process.env.KAFKA_CLIENT_ID || 'local-campaign-cluster',
+  brokers,
+  ssl: false, // no SSL for local setup
+  sasl: undefined, // no SASL for local
+  logLevel: logLevel.INFO,
+});
 
 let producer = null;
 let admin = null;
@@ -69,12 +62,16 @@ async function ensureTopics(topicNames = []) {
     const toCreate = topicNames.filter(t => !existing.includes(t));
     if (toCreate.length) {
       await admin.createTopics({
-        topics: toCreate.map(name => ({ topic: name, numPartitions: 1, replicationFactor: 3 })),
+        topics: toCreate.map(name => ({
+          topic: name,
+          numPartitions: 1,
+          replicationFactor: 1, // single-node EC2 setup
+        })),
         waitForLeaders: true
       });
+      console.log('[kafka] created topics:', toCreate);
     }
   } catch (e) {
-    // Log only; sending code will still retry
     console.warn('[kafka] ensureTopics failed:', e?.message || e);
   }
 }

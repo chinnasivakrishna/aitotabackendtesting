@@ -6,18 +6,16 @@ async function sendWithRetry(topic, messages, attempts = 2) {
     try {
       const producer = await getProducer();
       await producer.send({ topic, messages });
+      console.log(`[kafka] sent ${messages.length} messages to topic "${topic}"`);
       return;
     } catch (e) {
       lastErr = e;
       if (i === 0) {
-        // On first failure, ensure topics exist
         await ensureTopics([topic]);
       }
-      // If closed connection or network, recreate producer and retry once
       try {
         await recreateProducer();
       } catch (_) {}
-      // brief backoff
       await new Promise(r => setTimeout(r, 200 * (i + 1)));
     }
   }
