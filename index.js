@@ -1,21 +1,10 @@
-const { Kafka } = require('kafkajs');
+const { Kafka, Partitioners } = require('kafkajs');
 
 const kafka = new Kafka({
-  clientId: 'backend-service',
-  brokers: ['65.0.121.205:9092']
+  clientId: 'democluster2',
+  brokers: ['b-3.democluster2.p5hw9r.c2.kafka.ap-south-1.amazonaws.com:9098'],
 });
 
-const producer = kafka.producer();
-
-const start = async () => {
-  await producer.connect();
-  await producer.send({
-    topic: 'test-topic',
-    messages: [
-      { value: 'Hello from Node.js on EC2!' },
-    ],
-  });
-  await producer.disconnect();
-};
-
-start().catch(console.error);
+const producer = kafka.producer({
+  createPartitioner: Partitioners.LegacyPartitioner,
+});
