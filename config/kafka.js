@@ -4,12 +4,20 @@ const brokers = process.env.KAFKA_BROKERS
   ? process.env.KAFKA_BROKERS.split(',').map(b => b.trim()).filter(Boolean)
   : [];
 
-const kafka = new Kafka({
-  clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
-  brokers,
-  ssl: true,
-  logLevel: logLevel.INFO,
-});
+  const { MSKAuth } = require('@jm18457/kafkajs-msk-iam-authentication');
+  const AWS = require('aws-sdk');
+  
+  const kafka = new Kafka({
+    clientId: process.env.KAFKA_CLIENT_ID || 'democluster2',
+    brokers,
+    ssl: true,
+    sasl: {
+      mechanism: 'aws',
+      authenticationProvider: MSKAuth(AWS),
+    },
+    logLevel: logLevel.INFO,
+  });
+  
 
 let producer = null;
 let admin = null;
