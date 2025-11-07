@@ -232,12 +232,24 @@ async function pollCampaignUpdates(campaignId, poller) {
 }
 
 function init(server) {
-  io = socketio(server, { 
-    cors: { origin: '*' },
-    transports: ['websocket', 'polling']
-  });
-  
-  console.log('✅ [SOCKET.IO] Campaign transcript WebSocket server initialized');
+  try {
+    io = socketio(server, { 
+      cors: { 
+        origin: '*',
+        methods: ['GET', 'POST'],
+        credentials: true
+      },
+      transports: ['websocket', 'polling'],
+      allowEIO3: true, // Support older Socket.IO clients
+      pingTimeout: 60000,
+      pingInterval: 25000
+    });
+    
+    console.log('✅ [SOCKET.IO] Campaign transcript WebSocket server initialized');
+  } catch (error) {
+    console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
+    throw error;
+  }
   
   io.on('connection', socket => {
     console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
@@ -309,4 +321,25 @@ function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
   }
 }
 
-module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot };
+function getStatus() {
+  if (!io) {
+    return { initialized: false, connectedClients: 0, activePollers: 0 };
+  }
+  
+  const connectedClients = io.sockets.sockets.size;
+  const activePollers = campaignPollers.size;
+  const pollerDetails = Array.from(campaignPollers.entries()).map(([campaignId, poller]) => ({
+    campaignId,
+    refCount: poller.refCount,
+    running: poller.running
+  }));
+  
+  return {
+    initialized: true,
+    connectedClients,
+    activePollers,
+    pollerDetails
+  };
+}
+
+module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot, getStatus };

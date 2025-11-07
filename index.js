@@ -899,6 +899,25 @@ app.get('/ws/status', (req, res) => {
     });
 });
 
+// Socket.IO campaign transcripts status endpoint
+app.get('/api/campaigns/ws/status', (req, res) => {
+    try {
+        const wsStatus = campaignRealtime.getStatus();
+        res.json({
+            success: true,
+            data: wsStatus,
+            message: wsStatus.initialized 
+                ? 'Socket.IO server is running' 
+                : 'Socket.IO server not initialized'
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error?.message || 'Failed to get Socket.IO status'
+        });
+    }
+});
+
 // Paytm callback handler - redirects to frontend with orderId/status
 app.post('/api/v1/paytm/callback', async (req, res) => {
   try {
