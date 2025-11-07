@@ -4,6 +4,8 @@ const CallLog = require('../models/CallLog');
 const Campaign = require('../models/Campaign');
 
 let io = null;
+const campaignPollers = new Map(); // campaignId -> { refCount, timer, running, lastState: Map }
+const DEFAULT_POLL_INTERVAL_MS = 3000;
 
 function toPlain(doc) {
   if (!doc) return null;
@@ -140,19 +142,117 @@ async function emitCampaignSnapshot(socket, campaignId, options = {}) {
   }
 }
 
+function ensureCampaignPoller(campaignId) {
+  if (!campaignId) return;
+  const existing = campaignPollers.get(campaignId);
+  if (existing) {
+    existing.refCount += 1;
+    return existing;
+  }
+
+  const poller = {
+    refCount: 1,
+    running: false,
+    timer: null,
+    lastState: new Map(),
+  };
+
+  poller.timer = setInterval(() => {
+    pollCampaignUpdates(campaignId, poller).catch(err => {
+      console.error('[wsServer] campaign poller error:', err?.message || err);
+    });
+  }, DEFAULT_POLL_INTERVAL_MS);
+
+  campaignPollers.set(campaignId, poller);
+  return poller;
+}
+
+function releaseCampaignPoller(campaignId) {
+  const poller = campaignPollers.get(campaignId);
+  if (!poller) return;
+
+  poller.refCount -= 1;
+  if (poller.refCount <= 0) {
+    if (poller.timer) clearInterval(poller.timer);
+    campaignPollers.delete(campaignId);
+  }
+}
+
+async function pollCampaignUpdates(campaignId, poller) {
+  if (!io) return;
+  if (!poller || poller.running) return;
+  poller.running = true;
+
+  try {
+    const callLogs = await CallLog.find({ campaignId })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    const nextState = new Map();
+    const room = 'campaign-' + campaignId;
+
+    for (const log of callLogs) {
+      const formatted = formatCallLogEntry(log);
+      if (!formatted) continue;
+      const key = formatted.uniqueId || formatted.id;
+      if (!key) continue;
+
+      const serialized = JSON.stringify(formatted);
+      nextState.set(key, serialized);
+
+      const previous = poller.lastState.get(key);
+      if (previous !== serialized) {
+        io.to(room).emit('call-transcript-update', {
+          campaignId: String(campaignId),
+          uniqueId: formatted.uniqueId || formatted.id,
+          type: 'upsert',
+          call: formatted,
+        });
+      }
+    }
+
+    // Detect removed calls
+    for (const [key] of poller.lastState.entries()) {
+      if (!nextState.has(key)) {
+        io.to(room).emit('call-transcript-update', {
+          campaignId: String(campaignId),
+          uniqueId: key,
+          type: 'remove',
+        });
+      }
+    }
+
+    poller.lastState = nextState;
+  } catch (error) {
+    console.error('[wsServer] pollCampaignUpdates failed:', error?.message || error);
+  } finally {
+    poller.running = false;
+  }
+}
+
 function init(server) {
   io = socketio(server, { cors: { origin: '*' } });
   io.on('connection', socket => {
+    socket.joinedCampaigns = new Set();
+
     socket.on('join-campaign', async campaignId => {
       if (!campaignId) return;
       const room = 'campaign-' + campaignId;
       socket.join(room);
+      if (!socket.joinedCampaigns.has(campaignId)) {
+        socket.joinedCampaigns.add(campaignId);
+        ensureCampaignPoller(campaignId);
+      }
       await emitCampaignSnapshot(socket, campaignId);
     });
 
     socket.on('leave-campaign', campaignId => {
       if (!campaignId) return;
       socket.leave('campaign-' + campaignId);
+       if (socket.joinedCampaigns?.has(campaignId)) {
+        socket.joinedCampaigns.delete(campaignId);
+        releaseCampaignPoller(campaignId);
+      }
     });
 
     socket.on('get-campaign-transcripts', async payload => {
@@ -161,6 +261,14 @@ function init(server) {
       await emitCampaignSnapshot(socket, campaignId, {
         limit: typeof limit === 'number' && limit > 0 ? limit : undefined,
       });
+    });
+
+    socket.on('disconnect', () => {
+      if (!socket.joinedCampaigns) return;
+      for (const campaignId of socket.joinedCampaigns) {
+        releaseCampaignPoller(campaignId);
+      }
+      socket.joinedCampaigns.clear();
     });
   });
 }
