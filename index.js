@@ -884,7 +884,14 @@ app.use(cors());
 
 // Initialize WebSocket server
 const wsServer = new VoiceChatWebSocketServer(server);
-campaignRealtime.init(server);
+
+// Initialize Socket.IO for campaign transcripts
+try {
+  campaignRealtime.init(server);
+  console.log('✅ Socket.IO initialization completed');
+} catch (error) {
+  console.error('❌ Failed to initialize Socket.IO:', error?.message || error);
+}
 
 app.get('/', (req,res)=>{
     res.send("hello world")
@@ -1802,6 +1809,18 @@ connectDB().then(async () => {
         console.log(`🚀 Server is running on http://localhost:${PORT}`);
         console.log(`🔌 WebSocket server is ready on ws://localhost:${PORT}`);
         console.log(`📊 WebSocket status: http://localhost:${PORT}/ws/status`);
+        
+        // Verify Socket.IO is initialized
+        try {
+            const wsStatus = campaignRealtime.getStatus();
+            if (wsStatus.initialized) {
+                console.log(`✅ Socket.IO is ready at http://localhost:${PORT}/socket.io/`);
+            } else {
+                console.warn('⚠️ Socket.IO not initialized - check logs above');
+            }
+        } catch (e) {
+            console.warn('⚠️ Could not verify Socket.IO status:', e?.message);
+        }
     });
 }).catch(err => {
     console.error('❌ Database connection failed:', err);

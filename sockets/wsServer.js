@@ -246,10 +246,18 @@ function init(server) {
     });
     
     console.log('✅ [SOCKET.IO] Campaign transcript WebSocket server initialized');
+    console.log('   - Path: /socket.io/');
+    console.log('   - Transports: websocket, polling');
+    console.log('   - CORS: enabled for all origins');
   } catch (error) {
     console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
     throw error;
   }
+  
+  // Log all connection attempts
+  io.engine.on('connection', (req) => {
+    console.log(`🔗 [SOCKET.IO] Connection attempt from ${req.socket.remoteAddress || 'unknown'}`);
+  });
   
   io.engine.on('connection_error', (err) => {
     console.error('❌ [SOCKET.IO] Engine connection error:', err?.message || err);
