@@ -908,7 +908,10 @@ app.get('/api/campaigns/ws/status', (req, res) => {
             data: wsStatus,
             message: wsStatus.initialized 
                 ? 'Socket.IO server is running' 
-                : 'Socket.IO server not initialized'
+                : 'Socket.IO server not initialized',
+            socketIoPath: '/socket.io/',
+            supportedTransports: ['websocket', 'polling'],
+            connectionUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=websocket`
         });
     } catch (error) {
         res.status(500).json({
@@ -916,6 +919,19 @@ app.get('/api/campaigns/ws/status', (req, res) => {
             error: error?.message || 'Failed to get Socket.IO status'
         });
     }
+});
+
+// Test endpoint to verify Socket.IO is accessible
+app.get('/socket.io/test', (req, res) => {
+    res.json({
+        success: true,
+        message: 'Socket.IO endpoint is accessible',
+        path: '/socket.io/',
+        instructions: {
+            websocketUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=websocket`,
+            pollingUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=polling`
+        }
+    });
 });
 
 // Paytm callback handler - redirects to frontend with orderId/status

@@ -251,8 +251,26 @@ function init(server) {
     throw error;
   }
   
+  io.engine.on('connection_error', (err) => {
+    console.error('❌ [SOCKET.IO] Engine connection error:', err?.message || err);
+    console.error('   Error details:', {
+      type: err?.type,
+      description: err?.description,
+      context: err?.context
+    });
+  });
+
+  io.engine.on('upgrade', () => {
+    console.log('⬆️ [SOCKET.IO] Transport upgraded to WebSocket');
+  });
+
+  io.engine.on('upgradeError', (err) => {
+    console.error('❌ [SOCKET.IO] Upgrade error (falling back to polling):', err?.message || err);
+  });
+
   io.on('connection', socket => {
     console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
+    console.log(`   Transport: ${socket.conn?.transport?.name || 'unknown'}`);
     socket.joinedCampaigns = new Set();
 
     socket.on('join-campaign', async campaignId => {
