@@ -202,6 +202,7 @@ async function pollCampaignUpdates(campaignId, poller) {
 
       const previous = poller.lastState.get(key);
       if (previous !== serialized) {
+        console.log(`📤 [SOCKET.IO] Emitting call-transcript-update for campaign ${campaignId}, uniqueId: ${formatted.uniqueId || formatted.id}`);
         io.to(room).emit('call-transcript-update', {
           campaignId: String(campaignId),
           uniqueId: formatted.uniqueId || formatted.id,
@@ -231,19 +232,32 @@ async function pollCampaignUpdates(campaignId, poller) {
 }
 
 function init(server) {
-  io = socketio(server, { cors: { origin: '*' } });
+  io = socketio(server, { 
+    cors: { origin: '*' },
+    transports: ['websocket', 'polling']
+  });
+  
+  console.log('✅ [SOCKET.IO] Campaign transcript WebSocket server initialized');
+  
   io.on('connection', socket => {
+    console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
     socket.joinedCampaigns = new Set();
 
     socket.on('join-campaign', async campaignId => {
-      if (!campaignId) return;
+      if (!campaignId) {
+        console.warn(`⚠️ [SOCKET.IO] join-campaign called without campaignId`);
+        return;
+      }
+      console.log(`📥 [SOCKET.IO] Client ${socket.id} joining campaign: ${campaignId}`);
       const room = 'campaign-' + campaignId;
       socket.join(room);
       if (!socket.joinedCampaigns.has(campaignId)) {
         socket.joinedCampaigns.add(campaignId);
         ensureCampaignPoller(campaignId);
+        console.log(`✅ [SOCKET.IO] Started poller for campaign: ${campaignId}`);
       }
       await emitCampaignSnapshot(socket, campaignId);
+      console.log(`📤 [SOCKET.IO] Sent initial snapshot to ${socket.id} for campaign: ${campaignId}`);
     });
 
     socket.on('leave-campaign', campaignId => {
@@ -264,6 +278,7 @@ function init(server) {
     });
 
     socket.on('disconnect', () => {
+      console.log(`🔌 [SOCKET.IO] Client disconnected: ${socket.id}`);
       if (!socket.joinedCampaigns) return;
       for (const campaignId of socket.joinedCampaigns) {
         releaseCampaignPoller(campaignId);
