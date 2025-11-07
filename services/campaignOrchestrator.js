@@ -23,34 +23,21 @@ exports.startCampaign = async (campaignId, { n, g, r, mode }) => {
   if (!campaign) throw new Error('Not found');
   await updateCampaignStatus(campaign, 'start');
   broadcastCampaign(campaign, 'start');
-  // Resolve agent reference: campaign.agent is an array of strings per schema
-  const agentRef = Array.isArray(campaign.agent) ? (campaign.agent[0] || null) : campaign.agent;
-  let agent = null;
-  if (agentRef) {
-    // Try by Mongo _id first, then by custom agentId field
-    agent = await Agent.findById(agentRef).lean();
-    if (!agent) {
-      agent = await Agent.findOne({ agentId: agentRef }).lean();
-    }
-  }
-  if (!agent) {
-    throw new Error('Agent not found for campaign. Please ensure campaign.agent contains a valid Agent ID or agentId');
-  }
-
-  // Batch contacts processing for N-G-R
-  const contacts = campaign.contacts;
-  function* batch(arr, size) { for (let i = 0; i < arr.length; i += size) yield arr.slice(i, i + size); }
-  const contactBatches = [...batch(contacts, n)];
-  for (const batch of contactBatches) {
-    if (mode === 'series') {
-      for (const contact of batch)
-        await handleCall(campaign, contact, agent);
-    } else {
-      await Promise.all(batch.map(contact => handleCall(campaign, contact, agent)));
-    }
-  }
-  await updateCampaignStatus(campaign, 'stop');
-  broadcastCampaign(campaign, 'stop');
+  
+  // Publish campaign start command to Kafka instead of processing directly
+  const campaignCommand = {
+    action: 'start',
+    campaignId: campaignId.toString(),
+    n: n || 1,
+    g: g || 5,
+    r: r || 30,
+    mode: mode || 'parallel',
+    timestamp: new Date().toISOString()
+  };
+  
+  console.log(`📨 [KAFKA] Publishing campaign start command for campaign ${campaignId}`);
+  await kafkaService.send('campaign-commands', campaignCommand);
+  console.log(`✅ [KAFKA] Campaign start command published successfully`);
 };
 
 async function handleCall(campaign, contact, agent) {
@@ -101,6 +88,17 @@ async function handleCall(campaign, contact, agent) {
 exports.stopCampaign = async campaignId => {
   const campaign = await Campaign.findById(campaignId);
   if (!campaign) throw new Error('Not found');
+  
+  // Publish stop command to Kafka
+  const campaignCommand = {
+    action: 'stop',
+    campaignId: campaignId.toString(),
+    timestamp: new Date().toISOString()
+  };
+  
+  console.log(`📨 [KAFKA] Publishing campaign stop command for campaign ${campaignId}`);
+  await kafkaService.send('campaign-commands', campaignCommand);
+  
   await updateCampaignStatus(campaign, 'stop');
   broadcastCampaign(campaign, 'stop');
 };
@@ -108,12 +106,35 @@ exports.stopCampaign = async campaignId => {
 exports.pauseCampaign = async campaignId => {
   const campaign = await Campaign.findById(campaignId);
   if (!campaign) throw new Error('Not found');
+  
+  // Publish pause command to Kafka
+  const campaignCommand = {
+    action: 'pause',
+    campaignId: campaignId.toString(),
+    timestamp: new Date().toISOString()
+  };
+  
+  console.log(`📨 [KAFKA] Publishing campaign pause command for campaign ${campaignId}`);
+  await kafkaService.send('campaign-commands', campaignCommand);
+  
   await updateCampaignStatus(campaign, 'pause');
   broadcastCampaign(campaign, 'pause');
 };
+
 exports.resumeCampaign = async campaignId => {
   const campaign = await Campaign.findById(campaignId);
   if (!campaign) throw new Error('Not found');
+  
+  // Publish resume command to Kafka
+  const campaignCommand = {
+    action: 'resume',
+    campaignId: campaignId.toString(),
+    timestamp: new Date().toISOString()
+  };
+  
+  console.log(`📨 [KAFKA] Publishing campaign resume command for campaign ${campaignId}`);
+  await kafkaService.send('campaign-commands', campaignCommand);
+  
   await updateCampaignStatus(campaign, 'resume');
   broadcastCampaign(campaign, 'resume');
 };

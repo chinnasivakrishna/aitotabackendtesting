@@ -14,6 +14,7 @@ const kafka = new Kafka({
 
 let producer = null;
 let admin = null;
+let consumer = null;
 
 async function getProducer() {
   try {
@@ -54,6 +55,27 @@ async function getAdmin() {
   return admin;
 }
 
+async function getConsumer(groupId = 'campaign-consumer-group') {
+  if (!consumer) {
+    consumer = kafka.consumer({ groupId });
+    await consumer.connect();
+  }
+  return consumer;
+}
+
+async function recreateConsumer(groupId = 'campaign-consumer-group') {
+  try {
+    if (consumer) {
+      try { await consumer.disconnect(); } catch (_) {}
+    }
+    consumer = kafka.consumer({ groupId });
+    await consumer.connect();
+    return consumer;
+  } catch (e) {
+    throw e;
+  }
+}
+
 async function ensureTopics(topicNames = []) {
   if (!Array.isArray(topicNames) || topicNames.length === 0) return;
   const admin = await getAdmin();
@@ -76,4 +98,4 @@ async function ensureTopics(topicNames = []) {
   }
 }
 
-module.exports = { getProducer, recreateProducer, getAdmin, ensureTopics };
+module.exports = { getProducer, recreateProducer, getAdmin, getConsumer, recreateConsumer, ensureTopics };

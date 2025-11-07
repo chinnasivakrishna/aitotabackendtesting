@@ -1751,6 +1751,17 @@ connectDB().then(async () => {
     } catch (error) {
         console.error('❌ SERVER RESTART: Error during stuck call check:', error);
     }
+    
+    // Start Kafka consumer for campaign commands
+    try {
+        const { startConsumer } = require('./services/campaignConsumer');
+        await startConsumer();
+        console.log('✅ Kafka consumer started for campaign processing');
+    } catch (error) {
+        console.error('❌ Failed to start Kafka consumer:', error);
+        // Don't exit - server can still run without consumer
+    }
+    
     server.listen(PORT, () => {
         console.log(`🚀 Server is running on http://localhost:${PORT}`);
         console.log(`🔌 WebSocket server is ready on ws://localhost:${PORT}`);
