@@ -26,6 +26,7 @@ const Client = require("./models/Client");
 const Payment = require("./models/Payment");
 const server = http.createServer(app);
 const campaignRoutes = require('./routes/campaignRoutes');
+const campaignRealtime = require('./sockets/wsServer');
 const errorHandler = require('./utils/errorHandler');
 // Cashfree callback (return_url handler)
 
@@ -883,6 +884,7 @@ app.use(cors());
 
 // Initialize WebSocket server
 const wsServer = new VoiceChatWebSocketServer(server);
+campaignRealtime.init(server);
 
 app.get('/', (req,res)=>{
     res.send("hello world")

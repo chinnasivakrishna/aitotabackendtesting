@@ -1,4 +1,5 @@
 const orchestrator = require('../services/campaignOrchestrator');
+const wsServer = require('../sockets/wsServer');
 exports.start = async (req, res, next) => {
   try {
     // Fire-and-forget to avoid gateway timeout; orchestration runs in background
@@ -23,4 +24,21 @@ exports.resume = async (req, res, next) => {
 exports.getStatus = async (req, res, next) => {
   try { res.json(await orchestrator.getStatus(req.params.id)); }
   catch (err) { next(err); }
+};
+exports.getTranscripts = async (req, res, next) => {
+  try {
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) : undefined;
+    const snapshot = await wsServer.buildCampaignTranscriptSnapshot(req.params.id, {
+      limit: Number.isFinite(limit) && limit > 0 ? limit : undefined,
+    });
+    res.json({ success: true, data: snapshot });
+  } catch (err) {
+    if (err?.message === 'Invalid campaignId' || err?.message === 'campaignId is required') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err?.message === 'Campaign not found') {
+      return res.status(404).json({ success: false, message: err.message });
+    }
+    next(err);
+  }
 };
