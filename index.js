@@ -1191,7 +1191,6 @@ app.post('/api/v1/client/proxy/clicktobot', async (req, res) => {
 app.use('/api/campaigns', campaignRoutes);
 app.use('/api/v1/superadmin',superadminRoutes);
 app.use('/api/v1/admin',adminRoutes);
-app.use('/api/v1/client',clientRoutes);
 // app.use('/api/v1/human-agent', humanAgentRoutes);
 app.use('/api/v1/auth/client/profile', profileRoutes);
 app.use('/api/v1/chat', chatRoutes);
