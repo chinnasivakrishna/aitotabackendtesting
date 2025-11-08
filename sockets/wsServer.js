@@ -55,33 +55,97 @@ function deriveCallStatus(log) {
 function formatCallLogEntry(rawLog) {
   if (!rawLog) return null;
   const log = toPlain(rawLog);
-  const transcriptText = log.transcript || '';
-  const uniqueId = log?.metadata?.customParams?.uniqueid || log?.metadata?.uniqueid || log?.uniqueId || log?.uniqueid;
-  return {
+  
+  // Get transcript from various possible locations
+  const transcriptText = log.transcript || 
+                        log?.metadata?.transcript || 
+                        log?.transcriptText || 
+                        '';
+  
+  const uniqueId = log?.metadata?.customParams?.uniqueid || 
+                   log?.metadata?.uniqueid || 
+                   log?.uniqueId || 
+                   log?.uniqueid ||
+                   log?.metadata?.customParams?.uniqueId ||
+                   null;
+  
+  // Parse transcript segments
+  const transcriptSegments = parseTranscriptLines(transcriptText);
+  
+  // Build comprehensive call log entry with ALL fields
+  const formatted = {
+    // Basic identifiers
     id: log._id ? String(log._id) : null,
     campaignId: log.campaignId ? String(log.campaignId) : null,
     agentId: log.agentId ? String(log.agentId) : null,
     clientId: log.clientId || null,
     uniqueId,
-    mobile: log.mobile || log?.metadata?.customParams?.customercontact || null,
+    
+    // Contact information
+    mobile: log.mobile || 
+            log?.metadata?.customParams?.customercontact || 
+            log?.metadata?.customParams?.phone ||
+            log?.phone ||
+            null,
+    
+    // Call status and disposition
     leadStatus: log.leadStatus || 'unknown',
     status: deriveCallStatus(log),
+    disposition: log.disposition || null,
+    subDisposition: log.subDisposition || null,
+    dispositionId: log.dispositionId || null,
+    subDispositionId: log.subDispositionId || null,
+    
+    // Timing information
     durationSeconds: typeof log.duration === 'number' ? log.duration : null,
-    recordingUrl: log.audioUrl || null,
-    startedAt: log.createdAt || null,
+    time: log.time || null,
+    startedAt: log.createdAt || log.time || null,
     updatedAt: log.updatedAt || log?.metadata?.lastUpdated || null,
+    
+    // Media and recording
+    recordingUrl: log.audioUrl || null,
+    streamSid: log.streamSid || null,
+    callSid: log.callSid || null,
+    
+    // Transcript information (comprehensive)
+    transcript: {
+      text: transcriptText,
+      segments: transcriptSegments,
+      segmentCount: transcriptSegments.length,
+      hasContent: transcriptText.length > 0,
+      lastUpdated: log.updatedAt || log?.metadata?.lastUpdated || null,
+    },
+    
+    // Complete metadata (all fields)
     metadata: {
       isActive: !!(log.metadata && log.metadata.isActive),
       callEndTime: log.metadata?.callEndTime || null,
+      callStartTime: log.createdAt || log.time || null,
+      callDirection: log.metadata?.callDirection || 'outbound',
       languages: Array.isArray(log.metadata?.languages) ? log.metadata.languages : [],
       customParams: log.metadata?.customParams || {},
       totalUpdates: log.metadata?.totalUpdates || 0,
+      userTranscriptCount: log.metadata?.userTranscriptCount || 0,
+      aiResponseCount: log.metadata?.aiResponseCount || 0,
+      callerId: log.metadata?.callerId || null,
+      averageResponseTime: log.metadata?.averageResponseTime || null,
+      sttProvider: log.metadata?.sttProvider || 'deepgram',
+      ttsProvider: log.metadata?.ttsProvider || 'sarvam',
+      llmProvider: log.metadata?.llmProvider || 'openai',
+      whatsappRequested: log.metadata?.whatsappRequested || false,
+      whatsappMessageSent: log.metadata?.whatsappMessageSent || false,
+      lastUpdated: log.metadata?.lastUpdated || log.updatedAt || null,
     },
-    transcript: {
-      text: transcriptText,
-      segments: parseTranscriptLines(transcriptText),
-    },
+    
+    // Raw fields (for debugging/completeness)
+    raw: {
+      streamSid: log.streamSid || null,
+      callSid: log.callSid || null,
+      time: log.time || null,
+    }
   };
+  
+  return formatted;
 }
 
 async function buildCampaignTranscriptSnapshot(campaignId, { limit = 200 } = {}) {
@@ -184,12 +248,14 @@ async function pollCampaignUpdates(campaignId, poller) {
   poller.running = true;
 
   try {
+    // Fetch call logs sorted by most recently updated first
     const callLogs = await CallLog.find({ campaignId })
       .sort({ updatedAt: -1 })
       .lean();
 
     const nextState = new Map();
     const room = 'campaign-' + campaignId;
+    let updateCount = 0;
 
     for (const log of callLogs) {
       const formatted = formatCallLogEntry(log);
@@ -201,15 +267,65 @@ async function pollCampaignUpdates(campaignId, poller) {
       nextState.set(key, serialized);
 
       const previous = poller.lastState.get(key);
-      if (previous !== serialized) {
-        console.log(`📤 [SOCKET.IO] Emitting call-transcript-update for campaign ${campaignId}, uniqueId: ${formatted.uniqueId || formatted.id}`);
+      let hasChanged = false;
+      let changeReason = '';
+      
+      if (!previous) {
+        // New call
+        hasChanged = true;
+        changeReason = 'new call';
+      } else {
+        // Compare specific fields that matter for updates
+        try {
+          const prevFormatted = JSON.parse(previous);
+          
+          // Check if transcript changed
+          const transcriptChanged = formatted.transcript?.text !== prevFormatted.transcript?.text;
+          const statusChanged = formatted.status !== prevFormatted.status;
+          const metadataChanged = JSON.stringify(formatted.metadata) !== JSON.stringify(prevFormatted.metadata);
+          const updatedAtChanged = formatted.updatedAt?.toString() !== prevFormatted.updatedAt?.toString();
+          
+          if (transcriptChanged || statusChanged || metadataChanged || updatedAtChanged) {
+            hasChanged = true;
+            const reasons = [];
+            if (transcriptChanged) reasons.push('transcript');
+            if (statusChanged) reasons.push('status');
+            if (metadataChanged) reasons.push('metadata');
+            if (updatedAtChanged) reasons.push('updatedAt');
+            changeReason = reasons.join(', ');
+          }
+        } catch (e) {
+          // If parsing fails, assume changed
+          hasChanged = true;
+          changeReason = 'parse error';
+        }
+      }
+      
+      if (hasChanged) {
+        updateCount++;
+        const transcriptLength = formatted.transcript?.text?.length || 0;
+        const segmentCount = formatted.transcript?.segmentCount || 0;
+        
+        console.log(`📤 [SOCKET.IO] Emitting call-transcript-update for campaign ${campaignId}`);
+        console.log(`   UniqueId: ${formatted.uniqueId || formatted.id}`);
+        console.log(`   Change: ${changeReason}`);
+        console.log(`   Status: ${formatted.status}, Transcript: ${transcriptLength} chars, ${segmentCount} segments`);
+        console.log(`   Mobile: ${formatted.mobile || 'N/A'}`);
+        console.log(`   Updated: ${formatted.updatedAt}`);
+        
         io.to(room).emit('call-transcript-update', {
           campaignId: String(campaignId),
           uniqueId: formatted.uniqueId || formatted.id,
           type: 'upsert',
           call: formatted,
+          timestamp: new Date().toISOString(),
+          changeReason: changeReason,
         });
       }
+    }
+    
+    if (updateCount > 0) {
+      console.log(`📊 [SOCKET.IO] Polled campaign ${campaignId}: ${updateCount} updates, ${callLogs.length} total calls`);
     }
 
     // Detect removed calls
