@@ -57,19 +57,26 @@ async function handleStartCampaign(command) {
   
   console.log(`🚀 [KAFKA-CONSUMER] Starting campaign ${campaignId} with N=${n}, G=${g}, R=${r}, mode=${mode}`);
   
-  const campaign = await Campaign.findById(campaignId);
+  // Fetch fresh campaign state from database to avoid stale cache
+  const campaign = await Campaign.findById(campaignId).lean();
   if (!campaign) {
     throw new Error(`Campaign ${campaignId} not found`);
   }
   
-  // Prevent starting if already running
+  // Prevent starting if already running - check fresh state
   if (campaign.isRunning) {
-    console.log(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running - skipping start command`);
+    console.log(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running (isRunning: ${campaign.isRunning}) - skipping start command`);
     return; // Don't start if already running
+  }
+  
+  // Re-fetch as Mongoose document for saving
+  const campaignDoc = await Campaign.findById(campaignId);
+  if (!campaignDoc) {
+    throw new Error(`Campaign ${campaignId} not found`);
   }
 
   // Resolve agent reference
-  const agentRef = Array.isArray(campaign.agent) ? (campaign.agent[0] || null) : campaign.agent;
+  const agentRef = Array.isArray(campaignDoc.agent) ? (campaignDoc.agent[0] || null) : campaignDoc.agent;
   let agent = null;
   if (agentRef) {
     agent = await Agent.findById(agentRef).lean();
@@ -83,18 +90,30 @@ async function handleStartCampaign(command) {
   }
 
   // Batch contacts processing for N-G-R
-  const contacts = campaign.contacts;
+  const contacts = campaignDoc.contacts;
   function* batch(arr, size) {
     for (let i = 0; i < arr.length; i += size) {
       yield arr.slice(i, i + size);
     }
   }
   
-  // Mark campaign as running before processing
-  campaign.isRunning = true;
-  campaign.status = 'running';
-  campaign.updatedAt = new Date();
-  await campaign.save();
+  // Mark campaign as running before processing - use atomic update to prevent race conditions
+  const updateResult = await Campaign.updateOne(
+    { _id: campaignId, isRunning: false },
+    { 
+      $set: { 
+        isRunning: true,
+        status: 'running',
+        updatedAt: new Date()
+      }
+    }
+  );
+  
+  if (updateResult.matchedCount === 0) {
+    console.log(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} was already running (race condition) - skipping start`);
+    return; // Another process already started it
+  }
+  
   console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} marked as running`);
   
   const contactBatches = [...batch(contacts, n || 1)];
@@ -103,10 +122,10 @@ async function handleStartCampaign(command) {
   for (const batch of contactBatches) {
     if (mode === 'series') {
       for (const contact of batch) {
-        await handleCall(campaign, contact, agent);
+        await handleCall(campaignDoc, contact, agent);
       }
     } else {
-      await Promise.all(batch.map(contact => handleCall(campaign, contact, agent)));
+      await Promise.all(batch.map(contact => handleCall(campaignDoc, contact, agent)));
     }
     
     // Wait for gap (G) between batches if specified
@@ -116,15 +135,24 @@ async function handleStartCampaign(command) {
     }
   }
   
-  // Update campaign status to stopped after all calls complete
-  campaign.status = 'stop';
-  campaign.isRunning = false;
-  campaign.updatedAt = new Date();
-  await campaign.save();
+  // Update campaign status to stopped after all calls complete - use atomic update
+  await Campaign.updateOne(
+    { _id: campaignId },
+    { 
+      $set: { 
+        status: 'stopped',
+        isRunning: false,
+        updatedAt: new Date()
+      }
+    }
+  );
+  
+  // Fetch updated campaign for broadcasting
+  const updatedCampaign = await Campaign.findById(campaignId).lean();
   
   // Broadcast completion
-  wsServer.broadcastCampaignEvent(campaign._id, 'stop', campaign);
-  kafkaService.send('campaign-status', { campaignId: campaign._id, status: 'stop' });
+  wsServer.broadcastCampaignEvent(campaignId, 'stop', updatedCampaign);
+  kafkaService.send('campaign-status', { campaignId: campaignId, status: 'stopped' });
   
   console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} completed successfully`);
 }
@@ -191,20 +219,30 @@ async function handleCall(campaign, contact, agent) {
 
 async function handleStopCampaign(command) {
   const { campaignId } = command;
-  const campaign = await Campaign.findById(campaignId);
-  if (!campaign) {
+  
+  // Use atomic update to ensure proper state change
+  const updateResult = await Campaign.updateOne(
+    { _id: campaignId },
+    { 
+      $set: { 
+        status: 'stopped',
+        isRunning: false,
+        updatedAt: new Date()
+      }
+    }
+  );
+  
+  if (updateResult.matchedCount === 0) {
     throw new Error(`Campaign ${campaignId} not found`);
   }
   
-  campaign.status = 'stop';
-  campaign.isRunning = false;
-  campaign.updatedAt = new Date();
-  await campaign.save();
+  // Fetch updated campaign for broadcasting
+  const campaign = await Campaign.findById(campaignId).lean();
   
-  wsServer.broadcastCampaignEvent(campaign._id, 'stop', campaign);
-  kafkaService.send('campaign-status', { campaignId: campaign._id, status: 'stop' });
+  wsServer.broadcastCampaignEvent(campaignId, 'stop', campaign);
+  kafkaService.send('campaign-status', { campaignId: campaignId, status: 'stopped' });
   
-  console.log(`🛑 [KAFKA-CONSUMER] Campaign ${campaignId} stopped`);
+  console.log(`🛑 [KAFKA-CONSUMER] Campaign ${campaignId} stopped (isRunning set to false)`);
 }
 
 async function handlePauseCampaign(command) {

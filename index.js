@@ -1800,16 +1800,23 @@ connectDB().then(async () => {
           console.log(`🛑 SERVER RESTART: Stopped ${runningCampaigns.modifiedCount} running campaign(s)`);
         }
         
-        const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');
-        await fixStuckCalls();
-        console.log('✅ SERVER RESTART: Stuck calls check completed');
-        await cleanupStaleActiveCalls();
-        console.log('✅ SERVER RESTART: Stale calls cleanup completed');
-        
-        // Only run if function exists (might not exist in all versions)
-        if (typeof cleanupStuckCampaignsOnRestart === 'function') {
-          await cleanupStuckCampaignsOnRestart();
-          console.log('✅ SERVER RESTART: Stuck campaigns cleanup completed');
+        // Try to run cleanup functions if they exist
+        try {
+          const campaignCallingService = require('./services/campaignCallingService');
+          if (typeof campaignCallingService.fixStuckCalls === 'function') {
+            await campaignCallingService.fixStuckCalls();
+            console.log('✅ SERVER RESTART: Stuck calls check completed');
+          }
+          if (typeof campaignCallingService.cleanupStaleActiveCalls === 'function') {
+            await campaignCallingService.cleanupStaleActiveCalls();
+            console.log('✅ SERVER RESTART: Stale calls cleanup completed');
+          }
+          if (typeof campaignCallingService.cleanupStuckCampaignsOnRestart === 'function') {
+            await campaignCallingService.cleanupStuckCampaignsOnRestart();
+            console.log('✅ SERVER RESTART: Stuck campaigns cleanup completed');
+          }
+        } catch (cleanupError) {
+          console.warn('⚠️ SERVER RESTART: Some cleanup functions not available:', cleanupError?.message);
         }
     } catch (error) {
         console.error('❌ SERVER RESTART: Error during stuck call check:', error);
