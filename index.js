@@ -1785,19 +1785,35 @@ connectDB().then(async () => {
         }
       
         // Stop all running campaigns on server restart
+        console.log('🔄 SERVER RESTART: Checking for running campaigns to stop...');
         const Campaign = require('./models/Campaign');
-        const runningCampaigns = await Campaign.updateMany(
-          { isRunning: true },
-          { 
-            $set: { 
-              isRunning: false,
-              status: 'stopped',
-              updatedAt: new Date()
+        
+        // First, check how many are running
+        const runningCount = await Campaign.countDocuments({ isRunning: true });
+        console.log(`📊 SERVER RESTART: Found ${runningCount} campaign(s) marked as running`);
+        
+        if (runningCount > 0) {
+          const runningCampaigns = await Campaign.updateMany(
+            { isRunning: true },
+            { 
+              $set: { 
+                isRunning: false,
+                status: 'stopped',
+                updatedAt: new Date()
+              }
             }
-          }
-        );
-        if (runningCampaigns.modifiedCount > 0) {
+          );
           console.log(`🛑 SERVER RESTART: Stopped ${runningCampaigns.modifiedCount} running campaign(s)`);
+          
+          // Verify the update worked
+          const stillRunning = await Campaign.countDocuments({ isRunning: true });
+          if (stillRunning > 0) {
+            console.warn(`⚠️ SERVER RESTART: Warning - ${stillRunning} campaign(s) still marked as running after stop attempt`);
+          } else {
+            console.log(`✅ SERVER RESTART: All campaigns successfully stopped`);
+          }
+        } else {
+          console.log(`✅ SERVER RESTART: No running campaigns found - all campaigns are stopped`);
         }
         
         // Try to run cleanup functions if they exist

@@ -65,8 +65,31 @@ async function handleStartCampaign(command) {
   
   // Prevent starting if already running - check fresh state
   if (campaign.isRunning) {
-    console.log(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running (isRunning: ${campaign.isRunning}) - skipping start command`);
-    return; // Don't start if already running
+    // Check if campaign is actually stale (marked running but no recent activity)
+    const lastUpdate = campaign.updatedAt ? new Date(campaign.updatedAt) : null;
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    
+    if (lastUpdate && lastUpdate < fiveMinutesAgo) {
+      // Campaign is marked as running but hasn't been updated in 5+ minutes - likely stale
+      console.log(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is marked as running but appears stale (last update: ${lastUpdate.toISOString()})`);
+      console.log(`🔄 [KAFKA-CONSUMER] Resetting campaign state and starting...`);
+      
+      // Reset the stale campaign state
+      await Campaign.updateOne(
+        { _id: campaignId },
+        { 
+          $set: { 
+            isRunning: false,
+            status: 'stopped',
+            updatedAt: new Date()
+          }
+        }
+      );
+      // Continue with start process below
+    } else {
+      console.log(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running (isRunning: ${campaign.isRunning}) - skipping start command`);
+      return; // Don't start if already running and not stale
+    }
   }
   
   // Re-fetch as Mongoose document for saving
