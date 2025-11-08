@@ -55,97 +55,33 @@ function deriveCallStatus(log) {
 function formatCallLogEntry(rawLog) {
   if (!rawLog) return null;
   const log = toPlain(rawLog);
-  
-  // Get transcript from various possible locations
-  const transcriptText = log.transcript || 
-                        log?.metadata?.transcript || 
-                        log?.transcriptText || 
-                        '';
-  
-  const uniqueId = log?.metadata?.customParams?.uniqueid || 
-                   log?.metadata?.uniqueid || 
-                   log?.uniqueId || 
-                   log?.uniqueid ||
-                   log?.metadata?.customParams?.uniqueId ||
-                   null;
-  
-  // Parse transcript segments
-  const transcriptSegments = parseTranscriptLines(transcriptText);
-  
-  // Build comprehensive call log entry with ALL fields
-  const formatted = {
-    // Basic identifiers
+  const transcriptText = log.transcript || '';
+  const uniqueId = log?.metadata?.customParams?.uniqueid || log?.metadata?.uniqueid || log?.uniqueId || log?.uniqueid;
+  return {
     id: log._id ? String(log._id) : null,
     campaignId: log.campaignId ? String(log.campaignId) : null,
     agentId: log.agentId ? String(log.agentId) : null,
     clientId: log.clientId || null,
     uniqueId,
-    
-    // Contact information
-    mobile: log.mobile || 
-            log?.metadata?.customParams?.customercontact || 
-            log?.metadata?.customParams?.phone ||
-            log?.phone ||
-            null,
-    
-    // Call status and disposition
+    mobile: log.mobile || log?.metadata?.customParams?.customercontact || null,
     leadStatus: log.leadStatus || 'unknown',
     status: deriveCallStatus(log),
-    disposition: log.disposition || null,
-    subDisposition: log.subDisposition || null,
-    dispositionId: log.dispositionId || null,
-    subDispositionId: log.subDispositionId || null,
-    
-    // Timing information
     durationSeconds: typeof log.duration === 'number' ? log.duration : null,
-    time: log.time || null,
-    startedAt: log.createdAt || log.time || null,
-    updatedAt: log.updatedAt || log?.metadata?.lastUpdated || null,
-    
-    // Media and recording
     recordingUrl: log.audioUrl || null,
-    streamSid: log.streamSid || null,
-    callSid: log.callSid || null,
-    
-    // Transcript information (comprehensive)
-    transcript: {
-      text: transcriptText,
-      segments: transcriptSegments,
-      segmentCount: transcriptSegments.length,
-      hasContent: transcriptText.length > 0,
-      lastUpdated: log.updatedAt || log?.metadata?.lastUpdated || null,
-    },
-    
-    // Complete metadata (all fields)
+    startedAt: log.createdAt || null,
+    updatedAt: log.updatedAt || log?.metadata?.lastUpdated || null,
     metadata: {
       isActive: !!(log.metadata && log.metadata.isActive),
       callEndTime: log.metadata?.callEndTime || null,
-      callStartTime: log.createdAt || log.time || null,
-      callDirection: log.metadata?.callDirection || 'outbound',
       languages: Array.isArray(log.metadata?.languages) ? log.metadata.languages : [],
       customParams: log.metadata?.customParams || {},
       totalUpdates: log.metadata?.totalUpdates || 0,
-      userTranscriptCount: log.metadata?.userTranscriptCount || 0,
-      aiResponseCount: log.metadata?.aiResponseCount || 0,
-      callerId: log.metadata?.callerId || null,
-      averageResponseTime: log.metadata?.averageResponseTime || null,
-      sttProvider: log.metadata?.sttProvider || 'deepgram',
-      ttsProvider: log.metadata?.ttsProvider || 'sarvam',
-      llmProvider: log.metadata?.llmProvider || 'openai',
-      whatsappRequested: log.metadata?.whatsappRequested || false,
-      whatsappMessageSent: log.metadata?.whatsappMessageSent || false,
-      lastUpdated: log.metadata?.lastUpdated || log.updatedAt || null,
     },
-    
-    // Raw fields (for debugging/completeness)
-    raw: {
-      streamSid: log.streamSid || null,
-      callSid: log.callSid || null,
-      time: log.time || null,
-    }
+    transcript: {
+      text: transcriptText,
+      segments: parseTranscriptLines(transcriptText),
+    },
   };
-  
-  return formatted;
 }
 
 async function buildCampaignTranscriptSnapshot(campaignId, { limit = 200 } = {}) {
@@ -242,56 +178,18 @@ function releaseCampaignPoller(campaignId) {
   }
 }
 
-// Simple hash function for transcript to detect changes efficiently
-function hashTranscript(text) {
-  if (!text) return '';
-  // Use length and first/last chars for quick comparison
-  return `${text.length}_${text.substring(0, 50)}_${text.substring(Math.max(0, text.length - 50))}`;
-}
-
 async function pollCampaignUpdates(campaignId, poller) {
   if (!io) return;
   if (!poller || poller.running) return;
-  
-  // Skip if no clients are listening to this campaign
-  const room = 'campaign-' + campaignId;
-  const socketsInRoom = await io.in(room).fetchSockets();
-  if (socketsInRoom.length === 0) {
-    return; // No clients, skip polling
-  }
-  
-  // Only poll if campaign is actually running
-  try {
-    const campaign = await Campaign.findById(campaignId).select('isRunning status').lean();
-    if (!campaign || !campaign.isRunning) {
-      return; // Campaign not running, skip polling
-    }
-  } catch (err) {
-    console.error(`[wsServer] Failed to check campaign status for ${campaignId}:`, err?.message);
-    return; // Skip polling if we can't verify campaign status
-  }
-  
   poller.running = true;
 
   try {
-    // Only poll calls that were updated in the last 40 seconds (active calls)
-    const fortySecondsAgo = new Date(Date.now() - 40000);
-    
-    // Efficient query: only fetch fields we need, use indexes
-    const callLogs = await CallLog.find({ 
-      campaignId,
-      $or: [
-        { 'metadata.isActive': true },
-        { updatedAt: { $gte: fortySecondsAgo } }
-      ]
-    })
-      .select('_id campaignId agentId clientId mobile time transcript duration leadStatus disposition subDisposition dispositionId subDispositionId streamSid callSid audioUrl metadata updatedAt createdAt')
+    const callLogs = await CallLog.find({ campaignId })
       .sort({ updatedAt: -1 })
-      .lean()
-      .limit(100); // Limit to prevent memory issues
+      .lean();
 
     const nextState = new Map();
-    let updateCount = 0;
+    const room = 'campaign-' + campaignId;
 
     for (const log of callLogs) {
       const formatted = formatCallLogEntry(log);
@@ -299,69 +197,23 @@ async function pollCampaignUpdates(campaignId, poller) {
       const key = formatted.uniqueId || formatted.id;
       if (!key) continue;
 
-      // Store only essential data for comparison (transcript hash, status, metadata hash)
-      const transcriptHash = hashTranscript(formatted.transcript?.text || '');
-      const statusHash = `${formatted.status}_${formatted.leadStatus}_${formatted.metadata?.isActive ? 'active' : 'inactive'}`;
-      const metadataHash = `${formatted.metadata?.totalUpdates || 0}_${formatted.metadata?.userTranscriptCount || 0}_${formatted.metadata?.aiResponseCount || 0}`;
-      const stateHash = `${transcriptHash}|${statusHash}|${metadataHash}`;
-      
-      nextState.set(key, stateHash);
+      const serialized = JSON.stringify(formatted);
+      nextState.set(key, serialized);
 
       const previous = poller.lastState.get(key);
-      let hasChanged = false;
-      let changeReason = '';
-      
-      if (!previous) {
-        // New call - only emit if it's active or recently updated
-        if (formatted.metadata?.isActive || (formatted.updatedAt && new Date(formatted.updatedAt) >= fortySecondsAgo)) {
-          hasChanged = true;
-          changeReason = 'new call';
-        }
-      } else {
-        // Only emit if transcript, status, or meaningful metadata changed
-        if (previous !== stateHash) {
-          hasChanged = true;
-          const reasons = [];
-          const prevParts = previous.split('|');
-          if (prevParts[0] !== transcriptHash) reasons.push('transcript');
-          if (prevParts[1] !== statusHash) reasons.push('status');
-          if (prevParts[2] !== metadataHash) reasons.push('metadata');
-          changeReason = reasons.join(', ');
-          
-          // Only emit if transcript actually changed (not just timestamp)
-          if (!reasons.includes('transcript') && !reasons.includes('status') && !reasons.includes('metadata')) {
-            hasChanged = false; // Skip if only timestamp changed
-          }
-        }
-      }
-      
-      if (hasChanged) {
-        updateCount++;
-        const transcriptLength = formatted.transcript?.text?.length || 0;
-        const segmentCount = formatted.transcript?.segmentCount || 0;
-        
-        // Only log if transcript changed (reduce log spam)
-        if (changeReason.includes('transcript')) {
-          console.log(`📤 [SOCKET.IO] Transcript update for campaign ${campaignId}`);
-          console.log(`   UniqueId: ${formatted.uniqueId || formatted.id}`);
-          console.log(`   Transcript: ${transcriptLength} chars, ${segmentCount} segments`);
-        }
-        
+      if (previous !== serialized) {
         io.to(room).emit('call-transcript-update', {
           campaignId: String(campaignId),
           uniqueId: formatted.uniqueId || formatted.id,
           type: 'upsert',
           call: formatted,
-          timestamp: new Date().toISOString(),
-          changeReason: changeReason,
         });
       }
     }
-    
-    // Clean up old state entries (remove calls that are no longer active/recent)
+
+    // Detect removed calls
     for (const [key] of poller.lastState.entries()) {
       if (!nextState.has(key)) {
-        // Call was removed or is no longer active - emit remove event
         io.to(room).emit('call-transcript-update', {
           campaignId: String(campaignId),
           uniqueId: key,
@@ -369,13 +221,8 @@ async function pollCampaignUpdates(campaignId, poller) {
         });
       }
     }
-    
-    // Update state
+
     poller.lastState = nextState;
-    
-    if (updateCount > 0) {
-      console.log(`📊 [SOCKET.IO] Polled campaign ${campaignId}: ${updateCount} updates, ${callLogs.length} active/recent calls`);
-    }
   } catch (error) {
     console.error('[wsServer] pollCampaignUpdates failed:', error?.message || error);
   } finally {
@@ -384,93 +231,19 @@ async function pollCampaignUpdates(campaignId, poller) {
 }
 
 function init(server) {
-  try {
-    io = socketio(server, { 
-      cors: { 
-        origin: '*',
-        methods: ['GET', 'POST'],
-        credentials: true
-      },
-      transports: ['websocket', 'polling'],
-      allowEIO3: true, // Support older Socket.IO clients
-      pingTimeout: 60000,
-      pingInterval: 25000
-    });
-    
-    console.log('✅ [SOCKET.IO] Campaign transcript WebSocket server initialized');
-    console.log('   - Path: /socket.io/');
-    console.log('   - Transports: websocket, polling');
-    console.log('   - CORS: enabled for all origins');
-  } catch (error) {
-    console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
-    throw error;
-  }
-  
-  // Log all connection attempts
-  io.engine.on('connection', (req) => {
-    const remoteAddress = req?.socket?.remoteAddress || req?.headers?.['x-forwarded-for'] || req?.connection?.remoteAddress || 'unknown';
-    console.log(`🔗 [SOCKET.IO] Connection attempt from ${remoteAddress}`);
-  });
-  
-  io.engine.on('connection_error', (err) => {
-    console.error('❌ [SOCKET.IO] Engine connection error:', err?.message || err);
-    console.error('   Error details:', {
-      type: err?.type,
-      description: err?.description,
-      context: err?.context
-    });
-  });
-
-  io.engine.on('upgrade', () => {
-    console.log('⬆️ [SOCKET.IO] Transport upgraded to WebSocket');
-  });
-
-  io.engine.on('upgradeError', (err) => {
-    console.error('❌ [SOCKET.IO] Upgrade error (falling back to polling):', err?.message || err);
-  });
-
+  io = socketio(server, { cors: { origin: '*' } });
   io.on('connection', socket => {
-    console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
-    console.log(`   Transport: ${socket.conn?.transport?.name || 'unknown'}`);
     socket.joinedCampaigns = new Set();
 
     socket.on('join-campaign', async campaignId => {
-      if (!campaignId) {
-        console.warn(`⚠️ [SOCKET.IO] join-campaign called without campaignId`);
-        return;
-      }
-      console.log(`📥 [SOCKET.IO] Client ${socket.id} joining campaign: ${campaignId}`);
-      
-      // Check if campaign is running before starting poller
-      try {
-        const campaign = await Campaign.findById(campaignId).select('isRunning status name').lean();
-        if (!campaign) {
-          socket.emit('campaign-transcripts-error', {
-            campaignId,
-            message: 'Campaign not found'
-          });
-          return;
-        }
-        
-        if (!campaign.isRunning) {
-          console.log(`⚠️ [SOCKET.IO] Campaign ${campaignId} is not running - poller will not start`);
-          // Still allow client to join and get snapshot, but don't start poller
-        }
-      } catch (err) {
-        console.error(`[wsServer] Failed to check campaign status:`, err?.message);
-        // Continue anyway - let poller check on each iteration
-      }
-      
+      if (!campaignId) return;
       const room = 'campaign-' + campaignId;
       socket.join(room);
       if (!socket.joinedCampaigns.has(campaignId)) {
         socket.joinedCampaigns.add(campaignId);
-        // Only start poller if campaign is running (poller will check on each iteration)
         ensureCampaignPoller(campaignId);
-        console.log(`✅ [SOCKET.IO] Client joined campaign: ${campaignId} (poller will only run when campaign is active)`);
       }
       await emitCampaignSnapshot(socket, campaignId);
-      console.log(`📤 [SOCKET.IO] Sent initial snapshot to ${socket.id} for campaign: ${campaignId}`);
     });
 
     socket.on('leave-campaign', campaignId => {
@@ -491,7 +264,6 @@ function init(server) {
     });
 
     socket.on('disconnect', () => {
-      console.log(`🔌 [SOCKET.IO] Client disconnected: ${socket.id}`);
       if (!socket.joinedCampaigns) return;
       for (const campaignId of socket.joinedCampaigns) {
         releaseCampaignPoller(campaignId);
@@ -522,25 +294,4 @@ function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
   }
 }
 
-function getStatus() {
-  if (!io) {
-    return { initialized: false, connectedClients: 0, activePollers: 0 };
-  }
-  
-  const connectedClients = io.sockets.sockets.size;
-  const activePollers = campaignPollers.size;
-  const pollerDetails = Array.from(campaignPollers.entries()).map(([campaignId, poller]) => ({
-    campaignId,
-    refCount: poller.refCount,
-    running: poller.running
-  }));
-  
-  return {
-    initialized: true,
-    connectedClients,
-    activePollers,
-    pollerDetails
-  };
-}
-
-module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot, getStatus };
+module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot };

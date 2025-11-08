@@ -884,14 +884,7 @@ app.use(cors());
 
 // Initialize WebSocket server
 const wsServer = new VoiceChatWebSocketServer(server);
-
-// Initialize Socket.IO for campaign transcripts
-try {
-  campaignRealtime.init(server);
-  console.log('✅ Socket.IO initialization completed');
-} catch (error) {
-  console.error('❌ Failed to initialize Socket.IO:', error?.message || error);
-}
+campaignRealtime.init(server);
 
 app.get('/', (req,res)=>{
     res.send("hello world")
@@ -903,41 +896,6 @@ app.get('/ws/status', (req, res) => {
     res.json({
         success: true,
         data: status
-    });
-});
-
-// Socket.IO campaign transcripts status endpoint
-app.get('/api/campaigns/ws/status', (req, res) => {
-    try {
-        const wsStatus = campaignRealtime.getStatus();
-        res.json({
-            success: true,
-            data: wsStatus,
-            message: wsStatus.initialized 
-                ? 'Socket.IO server is running' 
-                : 'Socket.IO server not initialized',
-            socketIoPath: '/socket.io/',
-            supportedTransports: ['websocket', 'polling'],
-            connectionUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=websocket`
-        });
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error?.message || 'Failed to get Socket.IO status'
-        });
-    }
-});
-
-// Test endpoint to verify Socket.IO is accessible
-app.get('/socket.io/test', (req, res) => {
-    res.json({
-        success: true,
-        message: 'Socket.IO endpoint is accessible',
-        path: '/socket.io/',
-        instructions: {
-            websocketUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=websocket`,
-            pollingUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=polling`
-        }
     });
 });
 
@@ -1784,56 +1742,13 @@ connectDB().then(async () => {
             console.warn('⚠️ Kafka TLS connectivity test failed:', e && (e.stack || e.message || e));
         }
       
-        // Stop all running campaigns on server restart
-        console.log('🔄 SERVER RESTART: Checking for running campaigns to stop...');
-        const Campaign = require('./models/Campaign');
-        
-        // First, check how many are running
-        const runningCount = await Campaign.countDocuments({ isRunning: true });
-        console.log(`📊 SERVER RESTART: Found ${runningCount} campaign(s) marked as running`);
-        
-        if (runningCount > 0) {
-          const runningCampaigns = await Campaign.updateMany(
-            { isRunning: true },
-            { 
-              $set: { 
-                isRunning: false,
-                status: 'stopped',
-                updatedAt: new Date()
-              }
-            }
-          );
-          console.log(`🛑 SERVER RESTART: Stopped ${runningCampaigns.modifiedCount} running campaign(s)`);
-          
-          // Verify the update worked
-          const stillRunning = await Campaign.countDocuments({ isRunning: true });
-          if (stillRunning > 0) {
-            console.warn(`⚠️ SERVER RESTART: Warning - ${stillRunning} campaign(s) still marked as running after stop attempt`);
-          } else {
-            console.log(`✅ SERVER RESTART: All campaigns successfully stopped`);
-          }
-        } else {
-          console.log(`✅ SERVER RESTART: No running campaigns found - all campaigns are stopped`);
-        }
-        
-        // Try to run cleanup functions if they exist
-        try {
-          const campaignCallingService = require('./services/campaignCallingService');
-          if (typeof campaignCallingService.fixStuckCalls === 'function') {
-            await campaignCallingService.fixStuckCalls();
-            console.log('✅ SERVER RESTART: Stuck calls check completed');
-          }
-          if (typeof campaignCallingService.cleanupStaleActiveCalls === 'function') {
-            await campaignCallingService.cleanupStaleActiveCalls();
-            console.log('✅ SERVER RESTART: Stale calls cleanup completed');
-          }
-          if (typeof campaignCallingService.cleanupStuckCampaignsOnRestart === 'function') {
-            await campaignCallingService.cleanupStuckCampaignsOnRestart();
-            console.log('✅ SERVER RESTART: Stuck campaigns cleanup completed');
-          }
-        } catch (cleanupError) {
-          console.warn('⚠️ SERVER RESTART: Some cleanup functions not available:', cleanupError?.message);
-        }
+        const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');
+        await fixStuckCalls();
+        console.log('✅ SERVER RESTART: Stuck calls check completed');
+        await cleanupStaleActiveCalls();
+        console.log('✅ SERVER RESTART: Stale calls cleanup completed');
+        await cleanupStuckCampaignsOnRestart();
+        console.log('✅ SERVER RESTART: Stuck campaigns cleanup completed');
     } catch (error) {
         console.error('❌ SERVER RESTART: Error during stuck call check:', error);
     }
@@ -1852,18 +1767,6 @@ connectDB().then(async () => {
         console.log(`🚀 Server is running on http://localhost:${PORT}`);
         console.log(`🔌 WebSocket server is ready on ws://localhost:${PORT}`);
         console.log(`📊 WebSocket status: http://localhost:${PORT}/ws/status`);
-        
-        // Verify Socket.IO is initialized
-        try {
-            const wsStatus = campaignRealtime.getStatus();
-            if (wsStatus.initialized) {
-                console.log(`✅ Socket.IO is ready at http://localhost:${PORT}/socket.io/`);
-            } else {
-                console.warn('⚠️ Socket.IO not initialized - check logs above');
-            }
-        } catch (e) {
-            console.warn('⚠️ Could not verify Socket.IO status:', e?.message);
-        }
     });
 }).catch(err => {
     console.error('❌ Database connection failed:', err);
