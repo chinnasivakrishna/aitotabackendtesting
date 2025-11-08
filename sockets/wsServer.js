@@ -242,19 +242,44 @@ function releaseCampaignPoller(campaignId) {
   }
 }
 
+// Simple hash function for transcript to detect changes efficiently
+function hashTranscript(text) {
+  if (!text) return '';
+  // Use length and first/last chars for quick comparison
+  return `${text.length}_${text.substring(0, 50)}_${text.substring(Math.max(0, text.length - 50))}`;
+}
+
 async function pollCampaignUpdates(campaignId, poller) {
   if (!io) return;
   if (!poller || poller.running) return;
+  
+  // Skip if no clients are listening to this campaign
+  const room = 'campaign-' + campaignId;
+  const socketsInRoom = await io.in(room).fetchSockets();
+  if (socketsInRoom.length === 0) {
+    return; // No clients, skip polling
+  }
+  
   poller.running = true;
 
   try {
-    // Fetch call logs sorted by most recently updated first
-    const callLogs = await CallLog.find({ campaignId })
+    // Only poll calls that were updated in the last 40 seconds (active calls)
+    const fortySecondsAgo = new Date(Date.now() - 40000);
+    
+    // Efficient query: only fetch fields we need, use indexes
+    const callLogs = await CallLog.find({ 
+      campaignId,
+      $or: [
+        { 'metadata.isActive': true },
+        { updatedAt: { $gte: fortySecondsAgo } }
+      ]
+    })
+      .select('_id campaignId agentId clientId mobile time transcript duration leadStatus disposition subDisposition dispositionId subDispositionId streamSid callSid audioUrl metadata updatedAt createdAt')
       .sort({ updatedAt: -1 })
-      .lean();
+      .lean()
+      .limit(100); // Limit to prevent memory issues
 
     const nextState = new Map();
-    const room = 'campaign-' + campaignId;
     let updateCount = 0;
 
     for (const log of callLogs) {
@@ -263,41 +288,39 @@ async function pollCampaignUpdates(campaignId, poller) {
       const key = formatted.uniqueId || formatted.id;
       if (!key) continue;
 
-      const serialized = JSON.stringify(formatted);
-      nextState.set(key, serialized);
+      // Store only essential data for comparison (transcript hash, status, metadata hash)
+      const transcriptHash = hashTranscript(formatted.transcript?.text || '');
+      const statusHash = `${formatted.status}_${formatted.leadStatus}_${formatted.metadata?.isActive ? 'active' : 'inactive'}`;
+      const metadataHash = `${formatted.metadata?.totalUpdates || 0}_${formatted.metadata?.userTranscriptCount || 0}_${formatted.metadata?.aiResponseCount || 0}`;
+      const stateHash = `${transcriptHash}|${statusHash}|${metadataHash}`;
+      
+      nextState.set(key, stateHash);
 
       const previous = poller.lastState.get(key);
       let hasChanged = false;
       let changeReason = '';
       
       if (!previous) {
-        // New call
-        hasChanged = true;
-        changeReason = 'new call';
-      } else {
-        // Compare specific fields that matter for updates
-        try {
-          const prevFormatted = JSON.parse(previous);
-          
-          // Check if transcript changed
-          const transcriptChanged = formatted.transcript?.text !== prevFormatted.transcript?.text;
-          const statusChanged = formatted.status !== prevFormatted.status;
-          const metadataChanged = JSON.stringify(formatted.metadata) !== JSON.stringify(prevFormatted.metadata);
-          const updatedAtChanged = formatted.updatedAt?.toString() !== prevFormatted.updatedAt?.toString();
-          
-          if (transcriptChanged || statusChanged || metadataChanged || updatedAtChanged) {
-            hasChanged = true;
-            const reasons = [];
-            if (transcriptChanged) reasons.push('transcript');
-            if (statusChanged) reasons.push('status');
-            if (metadataChanged) reasons.push('metadata');
-            if (updatedAtChanged) reasons.push('updatedAt');
-            changeReason = reasons.join(', ');
-          }
-        } catch (e) {
-          // If parsing fails, assume changed
+        // New call - only emit if it's active or recently updated
+        if (formatted.metadata?.isActive || (formatted.updatedAt && new Date(formatted.updatedAt) >= fortySecondsAgo)) {
           hasChanged = true;
-          changeReason = 'parse error';
+          changeReason = 'new call';
+        }
+      } else {
+        // Only emit if transcript, status, or meaningful metadata changed
+        if (previous !== stateHash) {
+          hasChanged = true;
+          const reasons = [];
+          const prevParts = previous.split('|');
+          if (prevParts[0] !== transcriptHash) reasons.push('transcript');
+          if (prevParts[1] !== statusHash) reasons.push('status');
+          if (prevParts[2] !== metadataHash) reasons.push('metadata');
+          changeReason = reasons.join(', ');
+          
+          // Only emit if transcript actually changed (not just timestamp)
+          if (!reasons.includes('transcript') && !reasons.includes('status') && !reasons.includes('metadata')) {
+            hasChanged = false; // Skip if only timestamp changed
+          }
         }
       }
       
@@ -306,12 +329,12 @@ async function pollCampaignUpdates(campaignId, poller) {
         const transcriptLength = formatted.transcript?.text?.length || 0;
         const segmentCount = formatted.transcript?.segmentCount || 0;
         
-        console.log(`📤 [SOCKET.IO] Emitting call-transcript-update for campaign ${campaignId}`);
-        console.log(`   UniqueId: ${formatted.uniqueId || formatted.id}`);
-        console.log(`   Change: ${changeReason}`);
-        console.log(`   Status: ${formatted.status}, Transcript: ${transcriptLength} chars, ${segmentCount} segments`);
-        console.log(`   Mobile: ${formatted.mobile || 'N/A'}`);
-        console.log(`   Updated: ${formatted.updatedAt}`);
+        // Only log if transcript changed (reduce log spam)
+        if (changeReason.includes('transcript')) {
+          console.log(`📤 [SOCKET.IO] Transcript update for campaign ${campaignId}`);
+          console.log(`   UniqueId: ${formatted.uniqueId || formatted.id}`);
+          console.log(`   Transcript: ${transcriptLength} chars, ${segmentCount} segments`);
+        }
         
         io.to(room).emit('call-transcript-update', {
           campaignId: String(campaignId),
@@ -324,13 +347,10 @@ async function pollCampaignUpdates(campaignId, poller) {
       }
     }
     
-    if (updateCount > 0) {
-      console.log(`📊 [SOCKET.IO] Polled campaign ${campaignId}: ${updateCount} updates, ${callLogs.length} total calls`);
-    }
-
-    // Detect removed calls
+    // Clean up old state entries (remove calls that are no longer active/recent)
     for (const [key] of poller.lastState.entries()) {
       if (!nextState.has(key)) {
+        // Call was removed or is no longer active - emit remove event
         io.to(room).emit('call-transcript-update', {
           campaignId: String(campaignId),
           uniqueId: key,
@@ -338,8 +358,13 @@ async function pollCampaignUpdates(campaignId, poller) {
         });
       }
     }
-
+    
+    // Update state
     poller.lastState = nextState;
+    
+    if (updateCount > 0) {
+      console.log(`📊 [SOCKET.IO] Polled campaign ${campaignId}: ${updateCount} updates, ${callLogs.length} active/recent calls`);
+    }
   } catch (error) {
     console.error('[wsServer] pollCampaignUpdates failed:', error?.message || error);
   } finally {
@@ -372,7 +397,8 @@ function init(server) {
   
   // Log all connection attempts
   io.engine.on('connection', (req) => {
-    console.log(`🔗 [SOCKET.IO] Connection attempt from ${req.socket.remoteAddress || 'unknown'}`);
+    const remoteAddress = req?.socket?.remoteAddress || req?.headers?.['x-forwarded-for'] || req?.connection?.remoteAddress || 'unknown';
+    console.log(`🔗 [SOCKET.IO] Connection attempt from ${remoteAddress}`);
   });
   
   io.engine.on('connection_error', (err) => {
