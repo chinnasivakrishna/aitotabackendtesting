@@ -260,6 +260,17 @@ async function pollCampaignUpdates(campaignId, poller) {
     return; // No clients, skip polling
   }
   
+  // Only poll if campaign is actually running
+  try {
+    const campaign = await Campaign.findById(campaignId).select('isRunning status').lean();
+    if (!campaign || !campaign.isRunning) {
+      return; // Campaign not running, skip polling
+    }
+  } catch (err) {
+    console.error(`[wsServer] Failed to check campaign status for ${campaignId}:`, err?.message);
+    return; // Skip polling if we can't verify campaign status
+  }
+  
   poller.running = true;
 
   try {
@@ -429,12 +440,34 @@ function init(server) {
         return;
       }
       console.log(`📥 [SOCKET.IO] Client ${socket.id} joining campaign: ${campaignId}`);
+      
+      // Check if campaign is running before starting poller
+      try {
+        const campaign = await Campaign.findById(campaignId).select('isRunning status name').lean();
+        if (!campaign) {
+          socket.emit('campaign-transcripts-error', {
+            campaignId,
+            message: 'Campaign not found'
+          });
+          return;
+        }
+        
+        if (!campaign.isRunning) {
+          console.log(`⚠️ [SOCKET.IO] Campaign ${campaignId} is not running - poller will not start`);
+          // Still allow client to join and get snapshot, but don't start poller
+        }
+      } catch (err) {
+        console.error(`[wsServer] Failed to check campaign status:`, err?.message);
+        // Continue anyway - let poller check on each iteration
+      }
+      
       const room = 'campaign-' + campaignId;
       socket.join(room);
       if (!socket.joinedCampaigns.has(campaignId)) {
         socket.joinedCampaigns.add(campaignId);
+        // Only start poller if campaign is running (poller will check on each iteration)
         ensureCampaignPoller(campaignId);
-        console.log(`✅ [SOCKET.IO] Started poller for campaign: ${campaignId}`);
+        console.log(`✅ [SOCKET.IO] Client joined campaign: ${campaignId} (poller will only run when campaign is active)`);
       }
       await emitCampaignSnapshot(socket, campaignId);
       console.log(`📤 [SOCKET.IO] Sent initial snapshot to ${socket.id} for campaign: ${campaignId}`);
