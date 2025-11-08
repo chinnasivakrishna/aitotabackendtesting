@@ -33,7 +33,6 @@
     "paytmchecksum": "^1.5.0",
     "sarvamai": "^0.1.6",
     "socket.io": "^4.8.1",
-    "socket.io-client": "^4.8.1",
     "uuid": "^13.0.0",
     "ws": "^8.18.3"
   }

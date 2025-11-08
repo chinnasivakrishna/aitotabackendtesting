@@ -884,7 +884,14 @@ app.use(cors());
 
 // Initialize WebSocket server
 const wsServer = new VoiceChatWebSocketServer(server);
-campaignRealtime.init(server);
+
+// Initialize Socket.IO for campaign transcripts
+try {
+  campaignRealtime.init(server);
+  console.log('✅ Socket.IO initialization completed');
+} catch (error) {
+  console.error('❌ Failed to initialize Socket.IO:', error?.message || error);
+}
 
 app.get('/', (req,res)=>{
     res.send("hello world")
@@ -896,6 +903,41 @@ app.get('/ws/status', (req, res) => {
     res.json({
         success: true,
         data: status
+    });
+});
+
+// Socket.IO campaign transcripts status endpoint
+app.get('/api/campaigns/ws/status', (req, res) => {
+    try {
+        const wsStatus = campaignRealtime.getStatus();
+        res.json({
+            success: true,
+            data: wsStatus,
+            message: wsStatus.initialized 
+                ? 'Socket.IO server is running' 
+                : 'Socket.IO server not initialized',
+            socketIoPath: '/socket.io/',
+            supportedTransports: ['websocket', 'polling'],
+            connectionUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=websocket`
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error?.message || 'Failed to get Socket.IO status'
+        });
+    }
+});
+
+// Test endpoint to verify Socket.IO is accessible
+app.get('/socket.io/test', (req, res) => {
+    res.json({
+        success: true,
+        message: 'Socket.IO endpoint is accessible',
+        path: '/socket.io/',
+        instructions: {
+            websocketUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=websocket`,
+            pollingUrl: `${req.protocol}://${req.get('host')}/socket.io/?EIO=4&transport=polling`
+        }
     });
 });
 
@@ -1767,6 +1809,18 @@ connectDB().then(async () => {
         console.log(`🚀 Server is running on http://localhost:${PORT}`);
         console.log(`🔌 WebSocket server is ready on ws://localhost:${PORT}`);
         console.log(`📊 WebSocket status: http://localhost:${PORT}/ws/status`);
+        
+        // Verify Socket.IO is initialized
+        try {
+            const wsStatus = campaignRealtime.getStatus();
+            if (wsStatus.initialized) {
+                console.log(`✅ Socket.IO is ready at http://localhost:${PORT}/socket.io/`);
+            } else {
+                console.warn('⚠️ Socket.IO not initialized - check logs above');
+            }
+        } catch (e) {
+            console.warn('⚠️ Could not verify Socket.IO status:', e?.message);
+        }
     });
 }).catch(err => {
     console.error('❌ Database connection failed:', err);

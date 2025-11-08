@@ -202,6 +202,7 @@ async function pollCampaignUpdates(campaignId, poller) {
 
       const previous = poller.lastState.get(key);
       if (previous !== serialized) {
+        console.log(`📤 [SOCKET.IO] Emitting call-transcript-update for campaign ${campaignId}, uniqueId: ${formatted.uniqueId || formatted.id}`);
         io.to(room).emit('call-transcript-update', {
           campaignId: String(campaignId),
           uniqueId: formatted.uniqueId || formatted.id,
@@ -231,19 +232,70 @@ async function pollCampaignUpdates(campaignId, poller) {
 }
 
 function init(server) {
-  io = socketio(server, { cors: { origin: '*' } });
+  try {
+    io = socketio(server, { 
+      cors: { 
+        origin: '*',
+        methods: ['GET', 'POST'],
+        credentials: true
+      },
+      transports: ['websocket', 'polling'],
+      allowEIO3: true, // Support older Socket.IO clients
+      pingTimeout: 60000,
+      pingInterval: 25000
+    });
+    
+    console.log('✅ [SOCKET.IO] Campaign transcript WebSocket server initialized');
+    console.log('   - Path: /socket.io/');
+    console.log('   - Transports: websocket, polling');
+    console.log('   - CORS: enabled for all origins');
+  } catch (error) {
+    console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
+    throw error;
+  }
+  
+  // Log all connection attempts
+  io.engine.on('connection', (req) => {
+    console.log(`🔗 [SOCKET.IO] Connection attempt from ${req.socket.remoteAddress || 'unknown'}`);
+  });
+  
+  io.engine.on('connection_error', (err) => {
+    console.error('❌ [SOCKET.IO] Engine connection error:', err?.message || err);
+    console.error('   Error details:', {
+      type: err?.type,
+      description: err?.description,
+      context: err?.context
+    });
+  });
+
+  io.engine.on('upgrade', () => {
+    console.log('⬆️ [SOCKET.IO] Transport upgraded to WebSocket');
+  });
+
+  io.engine.on('upgradeError', (err) => {
+    console.error('❌ [SOCKET.IO] Upgrade error (falling back to polling):', err?.message || err);
+  });
+
   io.on('connection', socket => {
+    console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
+    console.log(`   Transport: ${socket.conn?.transport?.name || 'unknown'}`);
     socket.joinedCampaigns = new Set();
 
     socket.on('join-campaign', async campaignId => {
-      if (!campaignId) return;
+      if (!campaignId) {
+        console.warn(`⚠️ [SOCKET.IO] join-campaign called without campaignId`);
+        return;
+      }
+      console.log(`📥 [SOCKET.IO] Client ${socket.id} joining campaign: ${campaignId}`);
       const room = 'campaign-' + campaignId;
       socket.join(room);
       if (!socket.joinedCampaigns.has(campaignId)) {
         socket.joinedCampaigns.add(campaignId);
         ensureCampaignPoller(campaignId);
+        console.log(`✅ [SOCKET.IO] Started poller for campaign: ${campaignId}`);
       }
       await emitCampaignSnapshot(socket, campaignId);
+      console.log(`📤 [SOCKET.IO] Sent initial snapshot to ${socket.id} for campaign: ${campaignId}`);
     });
 
     socket.on('leave-campaign', campaignId => {
@@ -264,6 +316,7 @@ function init(server) {
     });
 
     socket.on('disconnect', () => {
+      console.log(`🔌 [SOCKET.IO] Client disconnected: ${socket.id}`);
       if (!socket.joinedCampaigns) return;
       for (const campaignId of socket.joinedCampaigns) {
         releaseCampaignPoller(campaignId);
@@ -294,4 +347,25 @@ function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
   }
 }
 
-module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot };
+function getStatus() {
+  if (!io) {
+    return { initialized: false, connectedClients: 0, activePollers: 0 };
+  }
+  
+  const connectedClients = io.sockets.sockets.size;
+  const activePollers = campaignPollers.size;
+  const pollerDetails = Array.from(campaignPollers.entries()).map(([campaignId, poller]) => ({
+    campaignId,
+    refCount: poller.refCount,
+    running: poller.running
+  }));
+  
+  return {
+    initialized: true,
+    connectedClients,
+    activePollers,
+    pollerDetails
+  };
+}
+
+module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot, getStatus };
