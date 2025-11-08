@@ -12,6 +12,17 @@ let consumerRunning = false;
 async function processCampaignCommand(message) {
   try {
     const command = JSON.parse(message.value.toString());
+    
+    // Check message timestamp - ignore messages older than 5 minutes
+    const messageTimestamp = message.timestamp ? new Date(parseInt(message.timestamp)) : null;
+    if (messageTimestamp) {
+      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+      if (messageTimestamp < fiveMinutesAgo) {
+        console.log(`⚠️ [KAFKA-CONSUMER] Ignoring old message (timestamp: ${messageTimestamp.toISOString()})`);
+        return; // Skip old messages
+      }
+    }
+    
     console.log(`📥 [KAFKA-CONSUMER] Received campaign command:`, command);
 
     if (command.action === 'start') {
@@ -32,13 +43,29 @@ async function processCampaignCommand(message) {
 }
 
 async function handleStartCampaign(command) {
-  const { campaignId, n, g, r, mode } = command;
+  const { campaignId, n, g, r, mode, timestamp } = command;
+  
+  // Ignore old messages (older than 5 minutes) - likely from before server restart
+  if (timestamp) {
+    const messageTime = new Date(timestamp);
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    if (messageTime < fiveMinutesAgo) {
+      console.log(`⚠️ [KAFKA-CONSUMER] Ignoring old start command for campaign ${campaignId} (timestamp: ${timestamp})`);
+      return; // Skip processing old messages
+    }
+  }
   
   console.log(`🚀 [KAFKA-CONSUMER] Starting campaign ${campaignId} with N=${n}, G=${g}, R=${r}, mode=${mode}`);
   
   const campaign = await Campaign.findById(campaignId);
   if (!campaign) {
     throw new Error(`Campaign ${campaignId} not found`);
+  }
+  
+  // Prevent starting if already running
+  if (campaign.isRunning) {
+    console.log(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running - skipping start command`);
+    return; // Don't start if already running
   }
 
   // Resolve agent reference
@@ -62,6 +89,13 @@ async function handleStartCampaign(command) {
       yield arr.slice(i, i + size);
     }
   }
+  
+  // Mark campaign as running before processing
+  campaign.isRunning = true;
+  campaign.status = 'running';
+  campaign.updatedAt = new Date();
+  await campaign.save();
+  console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} marked as running`);
   
   const contactBatches = [...batch(contacts, n || 1)];
   console.log(`📦 [KAFKA-CONSUMER] Processing ${contactBatches.length} batches for campaign ${campaignId}`);

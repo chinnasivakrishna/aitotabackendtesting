@@ -1784,13 +1784,33 @@ connectDB().then(async () => {
             console.warn('⚠️ Kafka TLS connectivity test failed:', e && (e.stack || e.message || e));
         }
       
+        // Stop all running campaigns on server restart
+        const Campaign = require('./models/Campaign');
+        const runningCampaigns = await Campaign.updateMany(
+          { isRunning: true },
+          { 
+            $set: { 
+              isRunning: false,
+              status: 'stopped',
+              updatedAt: new Date()
+            }
+          }
+        );
+        if (runningCampaigns.modifiedCount > 0) {
+          console.log(`🛑 SERVER RESTART: Stopped ${runningCampaigns.modifiedCount} running campaign(s)`);
+        }
+        
         const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');
         await fixStuckCalls();
         console.log('✅ SERVER RESTART: Stuck calls check completed');
         await cleanupStaleActiveCalls();
         console.log('✅ SERVER RESTART: Stale calls cleanup completed');
-        await cleanupStuckCampaignsOnRestart();
-        console.log('✅ SERVER RESTART: Stuck campaigns cleanup completed');
+        
+        // Only run if function exists (might not exist in all versions)
+        if (typeof cleanupStuckCampaignsOnRestart === 'function') {
+          await cleanupStuckCampaignsOnRestart();
+          console.log('✅ SERVER RESTART: Stuck campaigns cleanup completed');
+        }
     } catch (error) {
         console.error('❌ SERVER RESTART: Error during stuck call check:', error);
     }
