@@ -205,12 +205,13 @@ async function handleCall(campaign, contact, agent) {
   }
   
   let res;
+  let callInitiated = false;
   try {
     if (agent.serviceProvider === "c-zentrix" || agent.serviceProvider === "czentrix") {
       console.log(`📞 [KAFKA-CONSUMER] Calling via C-Zentrix: ${phone}`);
       if (!agent.callerId) {
         console.error(`❌ [KAFKA-CONSUMER] Agent missing callerId for C-Zentrix call`);
-        return;
+        throw new Error('Agent missing callerId for C-Zentrix call');
       }
       res = await telephonyService.callCzentrix({
         phone: contact.phone,
@@ -220,11 +221,22 @@ async function handleCall(campaign, contact, agent) {
         uniqueid
       });
       console.log(`✅ [KAFKA-CONSUMER] C-Zentrix call initiated. Response:`, res);
+      callInitiated = true;
+      
+      // Check if response indicates failure
+      if (res && (res.error || res.status === 'failed')) {
+        console.warn(`⚠️ [KAFKA-CONSUMER] C-Zentrix call failed:`, res.msg || res.message || res);
+        // Still wait for call log in case it gets created
+      }
     } else if (agent.serviceProvider === "sanpbx" || agent.serviceProvider === "snapbx") {
       console.log(`📞 [KAFKA-CONSUMER] Calling via SANPBX: ${phone}`);
       if (!agent.callerId) {
         console.error(`❌ [KAFKA-CONSUMER] Agent missing callerId for SANPBX call`);
-        return;
+        throw new Error('Agent missing callerId for SANPBX call');
+      }
+      if (!agent.accessToken) {
+        console.error(`❌ [KAFKA-CONSUMER] Agent missing accessToken for SANPBX call`);
+        throw new Error('Agent missing accessToken for SANPBX call');
       }
       res = await telephonyService.callSanpbx({
         phone: contact.phone,
@@ -233,14 +245,22 @@ async function handleCall(campaign, contact, agent) {
         uniqueid
       });
       console.log(`✅ [KAFKA-CONSUMER] SANPBX call initiated. Response:`, res);
+      callInitiated = true;
+      
+      // Check if response indicates failure
+      if (res && (res.error || res.status === 'failed')) {
+        console.warn(`⚠️ [KAFKA-CONSUMER] SANPBX call failed:`, res.msg || res.message || res);
+        // Still wait for call log in case it gets created
+      }
     } else {
       console.error(`❌ [KAFKA-CONSUMER] Unknown service provider: ${agent.serviceProvider}. Expected: c-zentrix, czentrix, sanpbx, or snapbx`);
-      return;
+      throw new Error(`Unknown service provider: ${agent.serviceProvider}`);
     }
   } catch (error) {
     console.error(`❌ [KAFKA-CONSUMER] Error initiating call to ${phone}:`, error?.message || error);
     console.error(`   Stack:`, error?.stack);
-    // Continue to create call log entry even if call initiation failed
+    // Mark as failed but continue to check for call log (in case it was created before error)
+    callInitiated = false;
   }
   
   // Wait for call log to be created (telephony service should create it)
