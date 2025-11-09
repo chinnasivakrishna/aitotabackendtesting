@@ -9,7 +9,7 @@ const { v4: uuidv4 } = require('uuid');
 
 let consumerRunning = false;
 
-async function processCampaignCommand(message) {
+async function processCampaignCommand(message, commitOffsetCallback = null) {
   try {
     const command = JSON.parse(message.value.toString());
     console.log(`📥 [KAFKA-CONSUMER] Received campaign command:`, command);
@@ -20,28 +20,38 @@ async function processCampaignCommand(message) {
       const maxAge = 5 * 60 * 1000; // 5 minutes
       if (messageAge > maxAge) {
         console.warn(`⚠️ [KAFKA-CONSUMER] Ignoring stale message (age: ${Math.round(messageAge / 1000)}s):`, command);
-        return; // Skip processing but don't throw - allow offset to be committed
+        // Commit offset for stale messages to prevent reprocessing
+        if (commitOffsetCallback) await commitOffsetCallback();
+        return; // Skip processing but commit offset
       }
     }
 
     if (command.action === 'start') {
-      await handleStartCampaign(command);
+      await handleStartCampaign(command, commitOffsetCallback);
     } else if (command.action === 'stop') {
       await handleStopCampaign(command);
+      // Commit offset immediately for stop (quick operation)
+      if (commitOffsetCallback) await commitOffsetCallback();
     } else if (command.action === 'pause') {
       await handlePauseCampaign(command);
+      // Commit offset immediately for pause (quick operation)
+      if (commitOffsetCallback) await commitOffsetCallback();
     } else if (command.action === 'resume') {
       await handleResumeCampaign(command);
+      // Commit offset immediately for resume (quick operation)
+      if (commitOffsetCallback) await commitOffsetCallback();
     } else {
       console.warn(`⚠️ [KAFKA-CONSUMER] Unknown action: ${command.action}`);
+      // Commit offset for unknown actions to prevent reprocessing
+      if (commitOffsetCallback) await commitOffsetCallback();
     }
   } catch (error) {
     console.error(`❌ [KAFKA-CONSUMER] Error processing campaign command:`, error);
-    throw error; // Re-throw to trigger retry mechanism
+    throw error; // Re-throw to prevent offset commit - message will be retried
   }
 }
 
-async function handleStartCampaign(command) {
+async function handleStartCampaign(command, commitOffsetCallback = null) {
   const { campaignId, n, g, r, mode } = command;
   
   console.log(`🚀 [KAFKA-CONSUMER] Starting campaign ${campaignId} with N=${n}, G=${g}, R=${r}, mode=${mode}`);
@@ -80,7 +90,9 @@ async function handleStartCampaign(command) {
     
     if (currentState.isRunning) {
       console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running, skipping duplicate start command`);
-      return; // Don't throw - allow offset to be committed
+      // Commit offset for duplicate start commands to prevent reprocessing
+      if (commitOffsetCallback) await commitOffsetCallback();
+      return; // Don't throw - offset already committed
     } else {
       // This shouldn't happen, but if isRunning is false and update failed, retry once
       console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} update failed despite isRunning=false, retrying...`);
@@ -91,6 +103,8 @@ async function handleStartCampaign(command) {
       );
       if (!retryCampaign) {
         console.error(`❌ [KAFKA-CONSUMER] Retry also failed for campaign ${campaignId}`);
+        // Commit offset even on retry failure to prevent infinite reprocessing
+        if (commitOffsetCallback) await commitOffsetCallback();
         return;
       }
       // Use retry result - reassign campaign variable
@@ -105,6 +119,13 @@ async function handleStartCampaign(command) {
   // Broadcast start event now that we've successfully marked it as running
   wsServer.broadcastCampaignEvent(campaign._id, 'start', campaign);
   kafkaService.send('campaign-status', { campaignId: campaign._id, status: 'start' });
+
+  // IMPORTANT: Commit offset immediately after marking campaign as running
+  // This prevents reprocessing if consumer is removed from group during long campaign execution
+  if (commitOffsetCallback) {
+    await commitOffsetCallback();
+    console.log(`✅ [KAFKA-CONSUMER] Offset committed for campaign ${campaignId} - campaign will continue processing even if consumer is removed`);
+  }
 
   // Resolve agent reference
   const agentRef = Array.isArray(campaign.agent) ? (campaign.agent[0] || null) : campaign.agent;
@@ -314,9 +335,25 @@ async function startConsumer() {
       eachMessage: async ({ topic, partition, message }) => {
         try {
           console.log(`📥 [KAFKA-CONSUMER] Received message from topic ${topic}, partition ${partition}, offset ${message.offset}`);
-          await processCampaignCommand(message);
-          // Offset will be auto-committed after successful processing
-          // KafkaJS commits offsets automatically after eachMessage completes successfully
+          
+          // Create commit callback for immediate offset commit after state update
+          const commitOffset = async () => {
+            try {
+              await consumerInstance.commitOffsets([{
+                topic,
+                partition,
+                offset: (parseInt(message.offset) + 1).toString() // Commit next offset
+              }]);
+              console.log(`✅ [KAFKA-CONSUMER] Offset ${message.offset} committed successfully`);
+            } catch (commitError) {
+              console.error(`❌ [KAFKA-CONSUMER] Failed to commit offset ${message.offset}:`, commitError?.message);
+            }
+          };
+          
+          // Process the command - commit happens inside for start commands (after marking as running)
+          // For other commands, commit happens in processCampaignCommand
+          await processCampaignCommand(message, commitOffset);
+          
         } catch (error) {
           console.error(`❌ [KAFKA-CONSUMER] Error processing message (offset ${message.offset}):`, error);
           // Re-throw to prevent offset commit - message will be retried

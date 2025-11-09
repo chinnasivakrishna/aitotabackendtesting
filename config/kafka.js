@@ -152,12 +152,12 @@ async function getConsumer(groupId = 'campaign-consumer-group') {
       }
       
       // Create and connect new consumer
+      // Increased session timeout to handle long-running campaigns (campaigns can take several minutes)
       consumer = kafka.consumer({ 
         groupId,
-        sessionTimeout: 30000,
-        heartbeatInterval: 3000,
-        // Auto-commit offsets after processing (default is true)
-        // This ensures offsets are committed after eachMessage completes successfully
+        sessionTimeout: 300000, // 5 minutes - enough for long campaigns
+        heartbeatInterval: 10000, // 10 seconds - send heartbeats more frequently
+        maxInFlightRequests: 1, // Process one message at a time
         allowAutoTopicCreation: false, // Don't auto-create topics
       });
       
@@ -190,9 +190,9 @@ async function recreateConsumer(groupId = 'campaign-consumer-group') {
     // Create new consumer
     consumer = kafka.consumer({ 
       groupId,
-      sessionTimeout: 30000,
-      heartbeatInterval: 3000,
-      // Auto-commit offsets after processing (default is true)
+      sessionTimeout: 300000, // 5 minutes - enough for long campaigns
+      heartbeatInterval: 10000, // 10 seconds - send heartbeats more frequently
+      maxInFlightRequests: 1, // Process one message at a time
       allowAutoTopicCreation: false, // Don't auto-create topics
     });
     
