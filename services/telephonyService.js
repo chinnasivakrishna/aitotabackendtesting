@@ -107,8 +107,27 @@ exports.callSanpbx = async ({ phone, agent, contact, uniqueid }) => {
   // Use agent's appId if available, otherwise default to 3
   const appId = agent.appId ? parseInt(agent.appId) : 3;
   
-  // Format phone number (remove + if present, ensure it's a string)
-  let formattedPhone = String(phone).replace(/^\+/, '');
+  // Format phone number for SANPBX:
+  // 1. Remove +91 if present
+  // 2. Add 0 before the number if it doesn't start with 0
+  const originalPhone = String(phone).trim();
+  let formattedPhone = originalPhone;
+  
+  // Remove +91 prefix if present
+  formattedPhone = formattedPhone.replace(/^\+91/, '');
+  
+  // Remove any remaining + sign
+  formattedPhone = formattedPhone.replace(/^\+/, '');
+  
+  // Remove any spaces or dashes
+  formattedPhone = formattedPhone.replace(/[\s\-]/g, '');
+  
+  // Add 0 prefix if number doesn't start with 0
+  if (!formattedPhone.startsWith('0')) {
+    formattedPhone = '0' + formattedPhone;
+  }
+  
+  console.log(`📞 [TELEPHONY] Phone number formatted: ${originalPhone} → ${formattedPhone}`);
   
   const body = {
     appid: appId,
