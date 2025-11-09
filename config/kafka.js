@@ -156,6 +156,9 @@ async function getConsumer(groupId = 'campaign-consumer-group') {
         groupId,
         sessionTimeout: 30000,
         heartbeatInterval: 3000,
+        // Auto-commit offsets after processing (default is true)
+        // This ensures offsets are committed after eachMessage completes successfully
+        allowAutoTopicCreation: false, // Don't auto-create topics
       });
       
       await consumer.connect();
@@ -189,6 +192,8 @@ async function recreateConsumer(groupId = 'campaign-consumer-group') {
       groupId,
       sessionTimeout: 30000,
       heartbeatInterval: 3000,
+      // Auto-commit offsets after processing (default is true)
+      allowAutoTopicCreation: false, // Don't auto-create topics
     });
     
     await consumer.connect();

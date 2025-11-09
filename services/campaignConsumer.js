@@ -14,6 +14,16 @@ async function processCampaignCommand(message) {
     const command = JSON.parse(message.value.toString());
     console.log(`📥 [KAFKA-CONSUMER] Received campaign command:`, command);
 
+    // Idempotency check: Ignore messages older than 5 minutes (likely from before restart)
+    if (command.timestamp) {
+      const messageAge = Date.now() - new Date(command.timestamp).getTime();
+      const maxAge = 5 * 60 * 1000; // 5 minutes
+      if (messageAge > maxAge) {
+        console.warn(`⚠️ [KAFKA-CONSUMER] Ignoring stale message (age: ${Math.round(messageAge / 1000)}s):`, command);
+        return; // Skip processing but don't throw - allow offset to be committed
+      }
+    }
+
     if (command.action === 'start') {
       await handleStartCampaign(command);
     } else if (command.action === 'stop') {
@@ -40,6 +50,22 @@ async function handleStartCampaign(command) {
   if (!campaign) {
     throw new Error(`Campaign ${campaignId} not found`);
   }
+
+  // Idempotency check: Skip if campaign is already running or already completed
+  if (campaign.isRunning) {
+    console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running, skipping duplicate start command`);
+    return; // Don't throw - allow offset to be committed
+  }
+
+  if (campaign.status === 'completed' || campaign.status === 'stopped') {
+    console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already ${campaign.status}, skipping start command`);
+    return; // Don't throw - allow offset to be committed
+  }
+
+  // Mark campaign as running before processing
+  campaign.isRunning = true;
+  campaign.status = 'running';
+  await campaign.save();
 
   // Resolve agent reference
   const agentRef = Array.isArray(campaign.agent) ? (campaign.agent[0] || null) : campaign.agent;
@@ -231,11 +257,14 @@ async function startConsumer() {
     await consumerInstance.run({
       eachMessage: async ({ topic, partition, message }) => {
         try {
-          console.log(`📥 [KAFKA-CONSUMER] Received message from topic ${topic}, partition ${partition}`);
+          console.log(`📥 [KAFKA-CONSUMER] Received message from topic ${topic}, partition ${partition}, offset ${message.offset}`);
           await processCampaignCommand(message);
+          // Offset will be auto-committed after successful processing
+          // KafkaJS commits offsets automatically after eachMessage completes successfully
         } catch (error) {
-          console.error(`❌ [KAFKA-CONSUMER] Error processing message:`, error);
-          // Message will be retried by Kafka if not committed
+          console.error(`❌ [KAFKA-CONSUMER] Error processing message (offset ${message.offset}):`, error);
+          // Re-throw to prevent offset commit - message will be retried
+          throw error;
         }
       },
     });
