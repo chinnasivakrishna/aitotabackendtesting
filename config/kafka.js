@@ -5,7 +5,32 @@ const brokers = process.env.KAFKA_BROKERS
   : ['localhost:9092']; // default for your EC2 Kafka
 
 // Determine SSL based on environment
-const useSSL = process.env.KAFKA_SSL === 'true' || process.env.KAFKA_USE_SSL === 'true';
+// Auto-detect: if connecting to localhost, default to no SSL unless explicitly enabled
+const isLocalhost = brokers.some(broker => 
+  broker.includes('localhost') || 
+  broker.includes('127.0.0.1') || 
+  broker.startsWith('localhost:') ||
+  broker.startsWith('127.0.0.1:')
+);
+
+// Check SSL env var (handle spaces and case variations)
+const sslEnv = (process.env.KAFKA_SSL || '').trim().toLowerCase();
+const sslUseEnv = (process.env.KAFKA_USE_SSL || '').trim().toLowerCase();
+const explicitSSL = sslEnv === 'true' || sslUseEnv === 'true';
+
+// For localhost, default to no SSL (most local Kafka setups don't use SSL)
+// For remote brokers, respect explicit SSL setting
+const useSSL = isLocalhost 
+  ? explicitSSL  // Only use SSL on localhost if explicitly set to true
+  : explicitSSL; // For remote, use explicit setting (defaults to false if not set)
+
+if (isLocalhost && useSSL) {
+  console.warn('⚠️ [KAFKA] SSL enabled for localhost - ensure your local Kafka broker supports TLS');
+} else if (isLocalhost && !useSSL) {
+  console.log('ℹ️ [KAFKA] SSL disabled for localhost (typical for local development)');
+} else if (!isLocalhost) {
+  console.log(`ℹ️ [KAFKA] SSL ${useSSL ? 'enabled' : 'disabled'} for remote brokers`);
+}
 
 const kafka = new Kafka({
   clientId: process.env.KAFKA_CLIENT_ID || 'local-campaign-cluster',

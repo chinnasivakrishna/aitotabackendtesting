@@ -24,10 +24,25 @@ async function sendWithRetry(topic, messages, attempts = 3) {
           errorMsg.includes('Connection') ||
           errorMsg.includes('ECONNREFUSED') ||
           errorMsg.includes('ECONNRESET') ||
-          errorMsg.includes('socket hang up');
+          errorMsg.includes('socket hang up') ||
+          errorMsg.includes('TLS connection') ||
+          errorMsg.includes('secure TLS connection');
+      
+      // Check if it's an SSL/TLS error
+      const isSSLError = errorMsg.includes('TLS') || 
+          errorMsg.includes('secure TLS') || 
+          errorMsg.includes('SSL') ||
+          errorMsg.includes('certificate');
       
       if (isConnectionError) {
-        console.warn(`[kafka] Connection error detected (attempt ${i + 1}/${attempts}): ${errorMsg}`);
+        // Special handling for SSL/TLS errors
+        if (isSSLError && i === 0) {
+          console.error(`[kafka] SSL/TLS connection error detected: ${errorMsg}`);
+          console.error(`[kafka] 💡 TIP: If connecting to localhost, set KAFKA_SSL=false or remove KAFKA_SSL`);
+          console.error(`[kafka] 💡 TIP: Local Kafka brokers typically don't use SSL`);
+        } else {
+          console.warn(`[kafka] Connection error detected (attempt ${i + 1}/${attempts}): ${errorMsg}`);
+        }
         
         // Ensure topics exist on first retry
         if (i === 0) {
