@@ -105,7 +105,7 @@ exports.callSanpbx = async ({ phone, agent, contact, uniqueid }) => {
   const apiToken = await exports.getSanpbxToken(agent);
   
   // Use agent's appId if available, otherwise default to 2
-  const appId = agent.appId ? parseInt(agent.appId) : 2;
+  const appId = 2;
   console.log(`📞 [TELEPHONY] App ID: ${appId}`);
   
   // Format phone number for SANPBX:
