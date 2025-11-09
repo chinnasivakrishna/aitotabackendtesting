@@ -152,13 +152,18 @@ async function handleStartCampaign(command, commitOffsetCallback = null) {
   const contactBatches = [...batch(contacts, n || 1)];
   console.log(`📦 [KAFKA-CONSUMER] Processing ${contactBatches.length} batches for campaign ${campaignId}`);
   
+  // Track all uniqueIds for calls initiated in this campaign
+  const activeUniqueIds = new Set();
+  
   for (const batch of contactBatches) {
     if (mode === 'series') {
       for (const contact of batch) {
-        await handleCall(campaign, contact, agent);
+        const uniqueId = await handleCall(campaign, contact, agent, activeUniqueIds);
+        if (uniqueId) activeUniqueIds.add(uniqueId);
       }
     } else {
-      await Promise.all(batch.map(contact => handleCall(campaign, contact, agent)));
+      const uniqueIds = await Promise.all(batch.map(contact => handleCall(campaign, contact, agent, activeUniqueIds)));
+      uniqueIds.forEach(id => { if (id) activeUniqueIds.add(id); });
     }
     
     // Wait for gap (G) between batches if specified
@@ -167,6 +172,10 @@ async function handleStartCampaign(command, commitOffsetCallback = null) {
       await new Promise(resolve => setTimeout(resolve, g * 1000));
     }
   }
+  
+  // Wait for all active calls to finish before marking campaign as completed
+  console.log(`⏳ [KAFKA-CONSUMER] Waiting for ${activeUniqueIds.size} active calls to finish for campaign ${campaignId}...`);
+  await waitForAllCallsToFinish(campaignId, activeUniqueIds);
   
   // Update campaign status to stopped after all calls complete
   // Use atomic update to prevent race conditions
@@ -184,10 +193,53 @@ async function handleStartCampaign(command, commitOffsetCallback = null) {
   wsServer.broadcastCampaignEvent(campaign._id, 'stop', campaign);
   kafkaService.send('campaign-status', { campaignId: campaign._id, status: 'stop' });
   
-  console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} completed successfully`);
+  console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} completed successfully - all calls finished`);
 }
 
-async function handleCall(campaign, contact, agent) {
+// Helper function to wait for all calls to finish
+async function waitForAllCallsToFinish(campaignId, uniqueIds) {
+  if (uniqueIds.size === 0) {
+    console.log(`✅ [KAFKA-CONSUMER] No active calls to wait for`);
+    return;
+  }
+  
+  const maxWaitTime = 30 * 60 * 1000; // 30 minutes max wait
+  const checkInterval = 5000; // Check every 5 seconds
+  const startTime = Date.now();
+  
+  while (uniqueIds.size > 0 && (Date.now() - startTime) < maxWaitTime) {
+    // Check which calls are still active
+    const activeCalls = await CallLog.find({
+      campaignId,
+      'metadata.customParams.uniqueid': { $in: Array.from(uniqueIds) },
+      'metadata.isActive': true
+    }).lean();
+    
+    const stillActiveUniqueIds = new Set(
+      activeCalls.map(call => call.metadata?.customParams?.uniqueid).filter(Boolean)
+    );
+    
+    // Remove finished calls from tracking
+    for (const uniqueId of uniqueIds) {
+      if (!stillActiveUniqueIds.has(uniqueId)) {
+        uniqueIds.delete(uniqueId);
+        console.log(`✅ [KAFKA-CONSUMER] Call ${uniqueId} finished, ${uniqueIds.size} calls remaining`);
+      }
+    }
+    
+    if (uniqueIds.size > 0) {
+      await new Promise(resolve => setTimeout(resolve, checkInterval));
+    }
+  }
+  
+  if (uniqueIds.size > 0) {
+    console.warn(`⚠️ [KAFKA-CONSUMER] Timeout waiting for ${uniqueIds.size} calls to finish. Marking campaign as completed anyway.`);
+  } else {
+    console.log(`✅ [KAFKA-CONSUMER] All calls finished for campaign ${campaignId}`);
+  }
+}
+
+async function handleCall(campaign, contact, agent, activeUniqueIds = null) {
   const uniqueid = uuidv4();
   const phone = contact.phone;
   
@@ -311,7 +363,22 @@ async function handleCall(campaign, contact, agent) {
   kafkaService.send('call-status', { campaignId: campaign._id, uniqueid, status });
   wsServer.broadcastCallEvent(campaign._id, uniqueid, status, log);
   
+  // Publish transcript update via Kafka to reduce server load
+  if (log && log.transcript) {
+    kafkaService.send('call-transcript-update', {
+      campaignId: campaign._id,
+      uniqueId: uniqueid,
+      transcript: log.transcript,
+      mobile: phone,
+      status: log.isActive ? 'ongoing' : 'completed',
+      isActive: log.isActive || false
+    });
+  }
+  
   console.log(`📊 [KAFKA-CONSUMER] Call detail saved for ${phone}: status=${status}, uniqueid=${uniqueid}`);
+  
+  // Return uniqueId so it can be tracked for completion
+  return uniqueid;
 }
 
 async function handleStopCampaign(command) {

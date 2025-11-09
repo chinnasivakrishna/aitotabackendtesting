@@ -2,10 +2,12 @@ const socketio = require('socket.io');
 const mongoose = require('mongoose');
 const CallLog = require('../models/CallLog');
 const Campaign = require('../models/Campaign');
+const { getConsumer, ensureTopics } = require('../config/kafka');
 
 let io = null;
+let transcriptConsumerRunning = false;
 const campaignPollers = new Map(); // campaignId -> { refCount, timer, running, lastState: Map }
-const DEFAULT_POLL_INTERVAL_MS = 3000;
+const DEFAULT_POLL_INTERVAL_MS = 10000; // Increased to 10 seconds to reduce server load
 
 function toPlain(doc) {
   if (!doc) return null;
@@ -178,6 +180,38 @@ function releaseCampaignPoller(campaignId) {
   }
 }
 
+// Send array of all active calls for a campaign
+async function emitActiveCallsArray(campaignId) {
+  if (!io) return;
+  const room = 'campaign-' + campaignId;
+  
+  try {
+    // Get all active calls for this campaign
+    const activeCallLogs = await CallLog.find({ 
+      campaignId,
+      'metadata.isActive': true 
+    })
+      .sort({ updatedAt: -1 })
+      .lean();
+
+    // Format all active calls
+    const activeCallsArray = activeCallLogs
+      .map(log => formatCallLogEntry(log))
+      .filter(call => call !== null);
+
+    // Emit array of all active calls
+    io.to(room).emit('campaign-active-calls', {
+      campaignId: String(campaignId),
+      calls: activeCallsArray,
+      count: activeCallsArray.length
+    });
+    
+    console.log(`📤 [SOCKET.IO] Emitted ${activeCallsArray.length} active calls for campaign ${campaignId}`);
+  } catch (error) {
+    console.error('[wsServer] emitActiveCallsArray failed:', error?.message || error);
+  }
+}
+
 async function pollCampaignUpdates(campaignId, poller) {
   if (!io) return;
   if (!poller || poller.running) return;
@@ -224,10 +258,69 @@ async function pollCampaignUpdates(campaignId, poller) {
     }
 
     poller.lastState = nextState;
+    
+    // Also emit array of all active calls
+    await emitActiveCallsArray(campaignId);
   } catch (error) {
     console.error('[wsServer] pollCampaignUpdates failed:', error?.message || error);
   } finally {
     poller.running = false;
+  }
+}
+
+// Start Kafka consumer for transcript updates to reduce database polling
+async function startTranscriptConsumer() {
+  if (transcriptConsumerRunning) {
+    console.log('⚠️ [WS-KAFKA] Transcript consumer already running');
+    return;
+  }
+
+  try {
+    await ensureTopics(['call-transcript-update']);
+    const consumer = await getConsumer('ws-transcript-consumer-group');
+    
+    await consumer.subscribe({
+      topic: 'call-transcript-update',
+      fromBeginning: false
+    });
+    
+    console.log('✅ [WS-KAFKA] Subscribed to call-transcript-update topic');
+    
+    await consumer.run({
+      eachMessage: async ({ topic, partition, message }) => {
+        try {
+          const update = JSON.parse(message.value.toString());
+          const { campaignId, uniqueId, transcript, mobile, status, isActive } = update;
+          
+          if (!campaignId) return;
+          
+          // Emit active calls array when transcript updates
+          await emitActiveCallsArray(campaignId);
+          
+          // Also emit individual update for backward compatibility
+          if (io) {
+            const room = 'campaign-' + campaignId;
+            io.to(room).emit('call-transcript-update', {
+              campaignId: String(campaignId),
+              uniqueId,
+              transcript,
+              mobile,
+              status,
+              isActive,
+              type: 'upsert'
+            });
+          }
+        } catch (error) {
+          console.error('[WS-KAFKA] Error processing transcript update:', error?.message || error);
+        }
+      },
+    });
+    
+    transcriptConsumerRunning = true;
+    console.log('✅ [WS-KAFKA] Transcript consumer started');
+  } catch (error) {
+    console.error('❌ [WS-KAFKA] Failed to start transcript consumer:', error?.message || error);
+    transcriptConsumerRunning = false;
   }
 }
 
@@ -249,6 +342,11 @@ function init(server) {
     console.log('   - Path: /socket.io/');
     console.log('   - Transports: websocket, polling');
     console.log('   - CORS: enabled for all origins');
+    
+    // Start Kafka consumer for transcript updates (non-blocking)
+    startTranscriptConsumer().catch(err => {
+      console.warn('⚠️ [WS-KAFKA] Failed to start transcript consumer (will use polling):', err?.message);
+    });
   } catch (error) {
     console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
     throw error;
@@ -344,6 +442,11 @@ function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
       uniqueId,
       status,
     });
+    
+    // Also emit updated array of all active calls
+    emitActiveCallsArray(campaignId).catch(err => {
+      console.error('[wsServer] Error emitting active calls array:', err?.message);
+    });
   }
 }
 
@@ -368,4 +471,4 @@ function getStatus() {
   };
 }
 
-module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot, getStatus };
+module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot, getStatus, emitActiveCallsArray, startTranscriptConsumer };
