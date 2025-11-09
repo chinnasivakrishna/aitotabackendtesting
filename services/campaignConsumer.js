@@ -189,37 +189,82 @@ async function handleStartCampaign(command, commitOffsetCallback = null) {
 
 async function handleCall(campaign, contact, agent) {
   const uniqueid = uuidv4();
-  let res;
+  const phone = contact.phone;
   
-  if (agent.serviceProvider === "c-zentrix") {
-    res = await telephonyService.callCzentrix({
-      phone: contact.phone,
-      agent,
-      contact,
-      campaignId: campaign._id,
-      uniqueid
-    });
-  } else if (agent.serviceProvider === "sanpbx") {
-    res = await telephonyService.callSanpbx({
-      phone: contact.phone,
-      agent,
-      contact,
-      uniqueid
-    });
+  console.log(`📞 [KAFKA-CONSUMER] Initiating call for campaign ${campaign._id}, contact: ${phone}, agent: ${agent._id || agent.agentId}, provider: ${agent.serviceProvider}`);
+  
+  // Validate required fields
+  if (!phone) {
+    console.error(`❌ [KAFKA-CONSUMER] Missing phone number for contact:`, contact);
+    return;
   }
   
+  if (!agent.serviceProvider) {
+    console.error(`❌ [KAFKA-CONSUMER] Agent ${agent._id || agent.agentId} missing serviceProvider. Available fields:`, Object.keys(agent));
+    return;
+  }
+  
+  let res;
+  try {
+    if (agent.serviceProvider === "c-zentrix" || agent.serviceProvider === "czentrix") {
+      console.log(`📞 [KAFKA-CONSUMER] Calling via C-Zentrix: ${phone}`);
+      if (!agent.callerId) {
+        console.error(`❌ [KAFKA-CONSUMER] Agent missing callerId for C-Zentrix call`);
+        return;
+      }
+      res = await telephonyService.callCzentrix({
+        phone: contact.phone,
+        agent,
+        contact,
+        campaignId: campaign._id,
+        uniqueid
+      });
+      console.log(`✅ [KAFKA-CONSUMER] C-Zentrix call initiated. Response:`, res);
+    } else if (agent.serviceProvider === "sanpbx" || agent.serviceProvider === "snapbx") {
+      console.log(`📞 [KAFKA-CONSUMER] Calling via SANPBX: ${phone}`);
+      if (!agent.callerId) {
+        console.error(`❌ [KAFKA-CONSUMER] Agent missing callerId for SANPBX call`);
+        return;
+      }
+      res = await telephonyService.callSanpbx({
+        phone: contact.phone,
+        agent,
+        contact,
+        uniqueid
+      });
+      console.log(`✅ [KAFKA-CONSUMER] SANPBX call initiated. Response:`, res);
+    } else {
+      console.error(`❌ [KAFKA-CONSUMER] Unknown service provider: ${agent.serviceProvider}. Expected: c-zentrix, czentrix, sanpbx, or snapbx`);
+      return;
+    }
+  } catch (error) {
+    console.error(`❌ [KAFKA-CONSUMER] Error initiating call to ${phone}:`, error?.message || error);
+    console.error(`   Stack:`, error?.stack);
+    // Continue to create call log entry even if call initiation failed
+  }
+  
+  // Wait for call log to be created (telephony service should create it)
   let log = null;
   let waited = 0;
-  while (waited < 40000) {
+  const maxWait = 40000; // 40 seconds
+  while (waited < maxWait) {
     log = await CallLog.findOne({ "metadata.customParams.uniqueid": uniqueid });
-    if (log) break;
+    if (log) {
+      console.log(`✅ [KAFKA-CONSUMER] Call log found for ${phone}, uniqueid: ${uniqueid}`);
+      break;
+    }
     await new Promise(res => setTimeout(res, 2000));
     waited += 2000;
+  }
+  
+  if (!log) {
+    console.warn(`⚠️ [KAFKA-CONSUMER] Call log not found after ${maxWait/1000}s for ${phone}, uniqueid: ${uniqueid}. Call may have failed to initiate.`);
   }
   
   let status = "ringing";
   if (log && log.isActive) status = "ongoing";
   else if (log && !log.isActive) status = "completed";
+  else if (!log) status = "failed"; // Mark as failed if no log was created
   
   // Persist under the defined `details` array in Campaign schema
   const detail = {
@@ -245,6 +290,8 @@ async function handleCall(campaign, contact, agent) {
   
   kafkaService.send('call-status', { campaignId: campaign._id, uniqueid, status });
   wsServer.broadcastCallEvent(campaign._id, uniqueid, status, log);
+  
+  console.log(`📊 [KAFKA-CONSUMER] Call detail saved for ${phone}: status=${status}, uniqueid=${uniqueid}`);
 }
 
 async function handleStopCampaign(command) {
