@@ -1753,35 +1753,49 @@ const PORT = process.env.PORT || 4000;
 connectDB().then(async () => {
     // Always run maintenance on startup
     try {
-        // Optional: quick MSK IAM connectivity test (non-blocking)
+        // Optional: quick Kafka connectivity test (non-blocking)
+        // NOTE: This uses a separate Kafka instance to avoid interfering with the singleton
         try {
             const brokers = process.env.KAFKA_BROKERS ? process.env.KAFKA_BROKERS.split(',').map(b => b.trim()).filter(Boolean) : [];
-            console.log('🧩 Kafka config:', { clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1', brokers });
+            console.log('🧩 Kafka config:', { clientId: process.env.KAFKA_CLIENT_ID || 'local-campaign-cluster', brokers });
           if (brokers.length) {
-                console.log('🔎 Attempting Kafka TLS connect test (no SASL/IAM)...');
-                const kafka = new Kafka({
-                  clientId: process.env.KAFKA_CLIENT_ID || 'demo-cluster-1',
+                const useSSL = process.env.KAFKA_SSL === 'true' || process.env.KAFKA_USE_SSL === 'true';
+                console.log(`🔎 Attempting Kafka connectivity test (SSL: ${useSSL})...`);
+                
+                // Use a separate Kafka instance for testing to avoid interfering with singleton
+                const { Kafka } = require('kafkajs');
+                const testKafka = new Kafka({
+                  clientId: `${process.env.KAFKA_CLIENT_ID || 'local-campaign-cluster'}-test`,
                   brokers,
-                    ssl: true
-              });
-              const testProducer = kafka.producer();
+                  ssl: useSSL,
+                  connectionTimeout: 5000,
+                  requestTimeout: 10000,
+                });
+                
+              const testProducer = testKafka.producer();
               await testProducer.connect();
-                console.log('✅ Kafka TLS: Connected successfully ✅');
+                console.log('✅ Kafka: Test connection successful ✅');
       
-              // ✅ Try sending a test message
-              await testProducer.send({
-                  topic: 'test-topic',
-                  messages: [{ key: 'test', value: 'Kafka IAM connection successful!' }],
-              });
-                console.log('📨 Kafka test message sent successfully!');
+              // ✅ Try sending a test message (optional - may fail if topic doesn't exist)
+              try {
+                  await testProducer.send({
+                      topic: 'test-topic',
+                      messages: [{ key: 'test', value: JSON.stringify({ timestamp: new Date().toISOString() }) }],
+                  });
+                    console.log('📨 Kafka test message sent successfully!');
+              } catch (sendErr) {
+                  // Topic might not exist, that's okay for a test
+                  console.log('ℹ️ Kafka test message skipped (topic may not exist)');
+              }
       
               await testProducer.disconnect();
-                console.log('🔌 Kafka TLS: Disconnected (test complete)');
+                console.log('🔌 Kafka: Test connection closed');
           } else {
-              console.warn('⚠️ Kafka test skipped: KAFKA_BROKER env not set');
+              console.warn('⚠️ Kafka test skipped: KAFKA_BROKERS env not set');
           }
         } catch (e) {
-            console.warn('⚠️ Kafka TLS connectivity test failed:', e && (e.stack || e.message || e));
+            console.warn('⚠️ Kafka connectivity test failed (non-fatal):', e && (e.stack || e.message || e));
+            console.warn('   The application will continue - Kafka will be initialized on first use');
         }
       
         const { fixStuckCalls, cleanupStaleActiveCalls, cleanupStuckCampaignsOnRestart } = require('./services/campaignCallingService');

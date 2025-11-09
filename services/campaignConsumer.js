@@ -253,13 +253,22 @@ async function stopConsumer() {
   if (!consumerRunning) return;
   
   try {
-    const { getConsumer } = require('../config/kafka');
+    const { getConsumer, markConsumerDisconnected } = require('../config/kafka');
     const consumer = await getConsumer();
-    await consumer.disconnect();
+    try {
+      await consumer.disconnect();
+    } catch (disconnectErr) {
+      console.warn('[KAFKA-CONSUMER] Error during disconnect (non-fatal):', disconnectErr?.message);
+    }
+    markConsumerDisconnected();
     consumerRunning = false;
     console.log('🛑 [KAFKA-CONSUMER] Consumer stopped');
   } catch (error) {
     console.error('❌ [KAFKA-CONSUMER] Error stopping consumer:', error);
+    // Mark as disconnected even if there was an error
+    const { markConsumerDisconnected } = require('../config/kafka');
+    markConsumerDisconnected();
+    consumerRunning = false;
   }
 }
 

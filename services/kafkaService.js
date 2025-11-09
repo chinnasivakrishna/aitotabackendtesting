@@ -1,22 +1,56 @@
 const { getProducer, recreateProducer, ensureTopics } = require('../config/kafka');
 
-async function sendWithRetry(topic, messages, attempts = 2) {
+async function sendWithRetry(topic, messages, attempts = 3) {
   let lastErr = null;
   for (let i = 0; i < attempts; i++) {
     try {
       const producer = await getProducer();
+      
+      // Double-check producer is connected before sending
+      if (!producer) {
+        throw new Error('Producer is null');
+      }
+      
       await producer.send({ topic, messages });
       console.log(`[kafka] sent ${messages.length} messages to topic "${topic}"`);
       return;
     } catch (e) {
       lastErr = e;
-      if (i === 0) {
-        await ensureTopics([topic]);
+      const errorMsg = e?.message || String(e);
+      
+      // Check if it's a connection error - mark producer as disconnected
+      const isConnectionError = errorMsg.includes('write after end') || 
+          errorMsg.includes('disconnect') || 
+          errorMsg.includes('Connection') ||
+          errorMsg.includes('ECONNREFUSED') ||
+          errorMsg.includes('ECONNRESET') ||
+          errorMsg.includes('socket hang up');
+      
+      if (isConnectionError) {
+        console.warn(`[kafka] Connection error detected (attempt ${i + 1}/${attempts}): ${errorMsg}`);
+        
+        // Ensure topics exist on first retry
+        if (i === 0) {
+          try {
+            await ensureTopics([topic]);
+          } catch (topicErr) {
+            console.warn('[kafka] Topic creation failed:', topicErr?.message);
+          }
+        }
+        
+        // Recreate producer (this will handle cleanup of old producer)
+        try {
+          await recreateProducer();
+        } catch (recreateErr) {
+          console.error('[kafka] Failed to recreate producer:', recreateErr?.message);
+        }
+        
+        // Wait before retry (exponential backoff)
+        await new Promise(r => setTimeout(r, 500 * (i + 1)));
+      } else {
+        // For other errors, just wait and retry
+        await new Promise(r => setTimeout(r, 200 * (i + 1)));
       }
-      try {
-        await recreateProducer();
-      } catch (_) {}
-      await new Promise(r => setTimeout(r, 200 * (i + 1)));
     }
   }
   throw lastErr;
