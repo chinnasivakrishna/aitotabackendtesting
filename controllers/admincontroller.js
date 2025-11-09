@@ -570,7 +570,7 @@ const assignDidToAgent = async (req, res) => {
     if (didDoc.provider === 'snapbx' || didDoc.provider === 'sanpbx') {
       agent.accessToken = agent.accessToken || 'a0d99aafea8fe5d75bc05270335f92f3';
       agent.accessKey = agent.accessKey || 'mob';
-      agent.appId = agent.appId || '3';
+      agent.appId = agent.appId || '2';
     }
     
     await agent.save();
