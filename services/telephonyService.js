@@ -106,6 +106,7 @@ exports.callSanpbx = async ({ phone, agent, contact, uniqueid }) => {
   
   // Use agent's appId if available, otherwise default to 2
   const appId = agent.appId ? parseInt(agent.appId) : 2;
+  console.log(`📞 [TELEPHONY] App ID: ${appId}`);
   
   // Format phone number for SANPBX:
   // 1. Remove +91 if present
