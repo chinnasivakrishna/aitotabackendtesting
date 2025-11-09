@@ -9,13 +9,30 @@ const axios = require('axios');
 
 class VoiceChatWebSocketServer {
   constructor(server) {
-    this.wss = new WebSocket.Server({ server });
+    // Use noServer mode to avoid conflicts with transcript WebSocket server
+    // We'll handle upgrades manually, excluding /transcript path
+    this.wss = new WebSocket.Server({ noServer: true });
     this.connections = new Map(); // Map to store active connections
     this.voiceService = new VoiceService();
     
     // API Keys
     this.openaiApiKey = process.env.OPENAI_API_KEY;
     this.deepgramApiKey = process.env.DEEPGRAM_API_KEY;
+    
+    // Handle upgrade events, but skip /transcript path
+    server.on('upgrade', (request, socket, head) => {
+      const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+      
+      // Skip /transcript path - that's handled by transcript WebSocket server
+      if (pathname === '/transcript') {
+        return; // Let transcript server handle it
+      }
+      
+      // Handle all other WebSocket connections
+      this.wss.handleUpgrade(request, socket, head, (ws) => {
+        this.wss.emit('connection', ws, request);
+      });
+    });
     
     this.setupWebSocketServer();
   }

@@ -240,11 +240,8 @@ function init(server) {
     // Create WebSocket server using noServer to avoid conflicts with VoiceChatWebSocketServer
     wss = new WebSocket.Server({ noServer: true });
     
-    // Store the original upgrade handler if it exists
-    const existingUpgradeHandlers = server.listeners('upgrade').slice();
-    server.removeAllListeners('upgrade');
-    
-    // Handle upgrade requests - route based on path
+    // Handle upgrade events for /transcript path
+    // This must be set up BEFORE VoiceChatWebSocketServer is initialized
     server.on('upgrade', (request, socket, head) => {
       const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
       
@@ -253,13 +250,8 @@ function init(server) {
         wss.handleUpgrade(request, socket, head, (ws) => {
           wss.emit('connection', ws, request);
         });
-      } else {
-        // Pass to other WebSocket servers (VoiceChatWebSocketServer)
-        // Call existing handlers
-        for (const handler of existingUpgradeHandlers) {
-          handler(request, socket, head);
-        }
       }
+      // For other paths, let VoiceChatWebSocketServer handle them
     });
     
     console.log('✅ [WEBSOCKET] Transcript WebSocket server initialized');
