@@ -46,26 +46,39 @@ async function handleStartCampaign(command) {
   
   console.log(`🚀 [KAFKA-CONSUMER] Starting campaign ${campaignId} with N=${n}, G=${g}, R=${r}, mode=${mode}`);
   
-  const campaign = await Campaign.findById(campaignId);
-  if (!campaign) {
-    throw new Error(`Campaign ${campaignId} not found`);
-  }
+  // Use atomic update to set running state (only if not already running)
+  // This prevents race conditions if multiple start commands arrive simultaneously
+  const campaign = await Campaign.findOneAndUpdate(
+    {
+      _id: campaignId,
+      isRunning: false // Only update if not already running
+    },
+    {
+      $set: {
+        isRunning: true,
+        status: 'running',
+        updatedAt: new Date()
+      }
+    },
+    {
+      new: true, // Return updated document
+      runValidators: true
+    }
+  );
 
-  // Idempotency check: Skip if campaign is already running or already completed
-  if (campaign.isRunning) {
+  // If update returned null, campaign doesn't exist or was already running
+  if (!campaign) {
+    // Check if campaign exists
+    const exists = await Campaign.findById(campaignId);
+    if (!exists) {
+      throw new Error(`Campaign ${campaignId} not found`);
+    }
+    // Campaign exists but isRunning was true (already running)
     console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running, skipping duplicate start command`);
     return; // Don't throw - allow offset to be committed
   }
 
-  if (campaign.status === 'completed' || campaign.status === 'stopped') {
-    console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already ${campaign.status}, skipping start command`);
-    return; // Don't throw - allow offset to be committed
-  }
-
-  // Mark campaign as running before processing
-  campaign.isRunning = true;
-  campaign.status = 'running';
-  await campaign.save();
+  console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} marked as running, proceeding with execution`);
 
   // Resolve agent reference
   const agentRef = Array.isArray(campaign.agent) ? (campaign.agent[0] || null) : campaign.agent;
