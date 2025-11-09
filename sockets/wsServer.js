@@ -237,10 +237,29 @@ function stopUniqueIdPoller(connectionId) {
 
 function init(server) {
   try {
-    // Create WebSocket server on /transcript path
-    wss = new WebSocket.Server({ 
-      server,
-      path: '/transcript'
+    // Create WebSocket server using noServer to avoid conflicts with VoiceChatWebSocketServer
+    wss = new WebSocket.Server({ noServer: true });
+    
+    // Store the original upgrade handler if it exists
+    const existingUpgradeHandlers = server.listeners('upgrade').slice();
+    server.removeAllListeners('upgrade');
+    
+    // Handle upgrade requests - route based on path
+    server.on('upgrade', (request, socket, head) => {
+      const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+      
+      if (pathname === '/transcript') {
+        // Handle transcript WebSocket connections
+        wss.handleUpgrade(request, socket, head, (ws) => {
+          wss.emit('connection', ws, request);
+        });
+      } else {
+        // Pass to other WebSocket servers (VoiceChatWebSocketServer)
+        // Call existing handlers
+        for (const handler of existingUpgradeHandlers) {
+          handler(request, socket, head);
+        }
+      }
     });
     
     console.log('✅ [WEBSOCKET] Transcript WebSocket server initialized');

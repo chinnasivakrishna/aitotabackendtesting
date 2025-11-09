@@ -882,16 +882,17 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.use(cors());
 
-// Initialize WebSocket server
-const wsServer = new VoiceChatWebSocketServer(server);
-
-// Initialize Socket.IO for campaign transcripts
+// Initialize transcript WebSocket server FIRST (before VoiceChatWebSocketServer)
+// This ensures proper routing for /transcript path
 try {
   campaignRealtime.init(server);
-  console.log('✅ Socket.IO initialization completed');
+  console.log('✅ Transcript WebSocket server initialization completed');
 } catch (error) {
-  console.error('❌ Failed to initialize Socket.IO:', error?.message || error);
+  console.error('❌ Failed to initialize Transcript WebSocket server:', error?.message || error);
 }
+
+// Initialize VoiceChatWebSocket server (handles other WebSocket connections)
+const wsServer = new VoiceChatWebSocketServer(server);
 
 app.get('/', (req,res)=>{
     res.send("hello world")
