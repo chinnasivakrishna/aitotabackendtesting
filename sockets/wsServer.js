@@ -244,7 +244,13 @@ function init(server) {
       transports: ['websocket', 'polling'],
       allowEIO3: true, // Support older Socket.IO clients
       pingTimeout: 60000,
-      pingInterval: 25000
+      pingInterval: 25000,
+      // Additional options for production stability
+      maxHttpBufferSize: 1e8, // 100MB
+      allowRequest: (req, callback) => {
+        // Allow all connections
+        callback(null, true);
+      }
     });
     
     console.log('✅ [SOCKET.IO] Transcript WebSocket server initialized');
@@ -252,15 +258,29 @@ function init(server) {
     console.log('   - Transports: websocket, polling');
     console.log('   - CORS: enabled for all origins');
     console.log('   - Events: start-transcript, stop-transcript');
+    
+    // Global error handler
+    io.engine.on('error', (err) => {
+      console.error('❌ [SOCKET.IO] Engine error:', err?.message || err);
+    });
   } catch (error) {
     console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
+    console.error('   Stack:', error?.stack);
     throw error;
   }
   
-  // Log all connection attempts
+  // Log all connection attempts (with better error handling)
   io.engine.on('connection', (req) => {
-    const remoteAddress = req?.socket?.remoteAddress || req?.headers?.['x-forwarded-for'] || req?.connection?.remoteAddress || 'unknown';
-    console.log(`🔗 [SOCKET.IO] Connection attempt from ${remoteAddress}`);
+    try {
+      const remoteAddress = req?.socket?.remoteAddress || 
+                           req?.headers?.['x-forwarded-for'] || 
+                           req?.connection?.remoteAddress || 
+                           req?.socket?.remoteAddress || 
+                           'unknown';
+      console.log(`🔗 [SOCKET.IO] Connection attempt from ${remoteAddress}`);
+    } catch (err) {
+      console.log(`🔗 [SOCKET.IO] Connection attempt from unknown (error getting address: ${err?.message})`);
+    }
   });
   
   io.engine.on('connection_error', (err) => {
@@ -268,7 +288,8 @@ function init(server) {
     console.error('   Error details:', {
       type: err?.type,
       description: err?.description,
-      context: err?.context
+      context: err?.context,
+      code: err?.code
     });
   });
 
@@ -281,39 +302,71 @@ function init(server) {
   });
 
   io.on('connection', socket => {
-    console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
-    console.log(`   Transport: ${socket.conn?.transport?.name || 'unknown'}`);
+    try {
+      console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
+      console.log(`   Transport: ${socket.conn?.transport?.name || 'unknown'}`);
 
-    // Start tracking transcript for a uniqueId
-    socket.on('start-transcript', async uniqueId => {
-      if (!uniqueId) {
-        socket.emit('error', { message: 'uniqueId is required' });
-        return;
+      // Start tracking transcript for a uniqueId
+      socket.on('start-transcript', async uniqueId => {
+        try {
+          if (!uniqueId) {
+            socket.emit('error', { message: 'uniqueId is required' });
+            return;
+          }
+          
+          console.log(`📥 [SOCKET.IO] Client ${socket.id} started tracking transcript for uniqueId: ${uniqueId}`);
+          
+          // Stop any existing poller for this socket
+          stopUniqueIdPoller(socket.id);
+          
+          // Start new poller
+          startUniqueIdPoller(socket.id, uniqueId, socket);
+          
+          // Send initial transcript if available
+          await sendTranscriptUpdate(socket, uniqueId);
+        } catch (error) {
+          console.error(`❌ [SOCKET.IO] Error in start-transcript:`, error?.message || error);
+          socket.emit('error', { message: 'Failed to start transcript tracking', error: error?.message });
+        }
+      });
+
+      // Stop tracking transcript
+      socket.on('stop-transcript', () => {
+        try {
+          console.log(`🛑 [SOCKET.IO] Client ${socket.id} stopped tracking transcript`);
+          stopUniqueIdPoller(socket.id);
+          socket.emit('transcript-stopped', { message: 'Transcript tracking stopped' });
+        } catch (error) {
+          console.error(`❌ [SOCKET.IO] Error in stop-transcript:`, error?.message || error);
+        }
+      });
+
+      socket.on('disconnect', (reason) => {
+        try {
+          console.log(`🔌 [SOCKET.IO] Client disconnected: ${socket.id}, reason: ${reason}`);
+          stopUniqueIdPoller(socket.id);
+        } catch (error) {
+          console.error(`❌ [SOCKET.IO] Error in disconnect handler:`, error?.message || error);
+        }
+      });
+
+      // Handle connection errors
+      socket.on('error', (error) => {
+        console.error(`❌ [SOCKET.IO] Socket error for ${socket.id}:`, error?.message || error);
+      });
+
+      // Send connection confirmation
+      socket.emit('connected', { 
+        socketId: socket.id,
+        message: 'Connected to transcript WebSocket server',
+        events: ['start-transcript', 'stop-transcript']
+      });
+    } catch (error) {
+      console.error(`❌ [SOCKET.IO] Error setting up socket connection:`, error?.message || error);
+      if (socket && socket.connected) {
+        socket.emit('error', { message: 'Connection setup failed', error: error?.message });
       }
-      
-      console.log(`📥 [SOCKET.IO] Client ${socket.id} started tracking transcript for uniqueId: ${uniqueId}`);
-      
-      // Stop any existing poller for this socket
-      stopUniqueIdPoller(socket.id);
-      
-      // Start new poller
-      startUniqueIdPoller(socket.id, uniqueId, socket);
-      
-      // Send initial transcript if available
-      await sendTranscriptUpdate(socket, uniqueId);
-    });
-
-    // Stop tracking transcript
-    socket.on('stop-transcript', () => {
-      console.log(`🛑 [SOCKET.IO] Client ${socket.id} stopped tracking transcript`);
-      stopUniqueIdPoller(socket.id);
-      socket.emit('transcript-stopped', { message: 'Transcript tracking stopped' });
-    });
-
-    socket.on('disconnect', () => {
-      console.log(`🔌 [SOCKET.IO] Client disconnected: ${socket.id}`);
-      stopUniqueIdPoller(socket.id);
-    });
+    }
   });
 }
 
