@@ -2,12 +2,10 @@ const socketio = require('socket.io');
 const mongoose = require('mongoose');
 const CallLog = require('../models/CallLog');
 const Campaign = require('../models/Campaign');
-const { getConsumer, ensureTopics } = require('../config/kafka');
 
 let io = null;
-let transcriptConsumerRunning = false;
-const campaignPollers = new Map(); // campaignId -> { refCount, timer, running, lastState: Map }
-const DEFAULT_POLL_INTERVAL_MS = 10000; // Increased to 10 seconds to reduce server load
+const uniqueIdPollers = new Map(); // socketId -> { uniqueId, timer, running, lastTranscript }
+const DEFAULT_POLL_INTERVAL_MS = 2000; // Poll every 2 seconds for transcript updates
 
 function toPlain(doc) {
   if (!doc) return null;
@@ -144,185 +142,96 @@ async function emitCampaignSnapshot(socket, campaignId, options = {}) {
   }
 }
 
-function ensureCampaignPoller(campaignId) {
-  if (!campaignId) return;
-  const existing = campaignPollers.get(campaignId);
-  if (existing) {
-    existing.refCount += 1;
-    return existing;
-  }
 
+// Send transcript update for a specific uniqueId
+async function sendTranscriptUpdate(socket, uniqueId) {
+  try {
+    const callLog = await CallLog.findOne({ 
+      'metadata.customParams.uniqueid': uniqueId 
+    }).lean();
+
+    if (!callLog) {
+      socket.emit('transcript-update', {
+        uniqueId,
+        found: false,
+        message: 'Call log not found'
+      });
+      return;
+    }
+
+    const formatted = formatCallLogEntry(callLog);
+    if (formatted) {
+      socket.emit('transcript-update', {
+        uniqueId,
+        found: true,
+        call: formatted,
+        transcript: formatted.transcript,
+        mobile: formatted.mobile,
+        status: formatted.status,
+        isActive: formatted.metadata?.isActive || false,
+        updatedAt: formatted.updatedAt
+      });
+    }
+  } catch (error) {
+    console.error('[wsServer] sendTranscriptUpdate failed:', error?.message || error);
+    socket.emit('error', { message: 'Failed to fetch transcript', error: error?.message });
+  }
+}
+
+// Start polling for a uniqueId
+function startUniqueIdPoller(socketId, uniqueId, socket) {
+  // Stop existing poller if any
+  stopUniqueIdPoller(socketId);
+  
   const poller = {
-    refCount: 1,
+    uniqueId,
     running: false,
     timer: null,
-    lastState: new Map(),
+    lastTranscript: null
   };
 
+  const poll = async () => {
+    if (poller.running || !socket.connected) return;
+    poller.running = true;
+
+    try {
+      await sendTranscriptUpdate(socket, uniqueId);
+    } catch (error) {
+      console.error(`[wsServer] Poll error for ${uniqueId}:`, error?.message);
+    } finally {
+      poller.running = false;
+    }
+  };
+
+  // Poll immediately
+  poll();
+  
+  // Then poll at intervals
   poller.timer = setInterval(() => {
-    pollCampaignUpdates(campaignId, poller).catch(err => {
-      console.error('[wsServer] campaign poller error:', err?.message || err);
-    });
+    if (socket.connected) {
+      poll();
+    } else {
+      stopUniqueIdPoller(socketId);
+    }
   }, DEFAULT_POLL_INTERVAL_MS);
 
-  campaignPollers.set(campaignId, poller);
-  return poller;
+  uniqueIdPollers.set(socketId, poller);
+  console.log(`✅ [SOCKET.IO] Started poller for uniqueId: ${uniqueId}, socket: ${socketId}`);
 }
 
-function releaseCampaignPoller(campaignId) {
-  const poller = campaignPollers.get(campaignId);
-  if (!poller) return;
-
-  poller.refCount -= 1;
-  if (poller.refCount <= 0) {
-    if (poller.timer) clearInterval(poller.timer);
-    campaignPollers.delete(campaignId);
-  }
-}
-
-// Send array of all active calls for a campaign
-async function emitActiveCallsArray(campaignId) {
-  if (!io) return;
-  const room = 'campaign-' + campaignId;
-  
-  try {
-    // Get all active calls for this campaign
-    const activeCallLogs = await CallLog.find({ 
-      campaignId,
-      'metadata.isActive': true 
-    })
-      .sort({ updatedAt: -1 })
-      .lean();
-
-    // Format all active calls
-    const activeCallsArray = activeCallLogs
-      .map(log => formatCallLogEntry(log))
-      .filter(call => call !== null);
-
-    // Emit array of all active calls
-    io.to(room).emit('campaign-active-calls', {
-      campaignId: String(campaignId),
-      calls: activeCallsArray,
-      count: activeCallsArray.length
-    });
-    
-    console.log(`📤 [SOCKET.IO] Emitted ${activeCallsArray.length} active calls for campaign ${campaignId}`);
-  } catch (error) {
-    console.error('[wsServer] emitActiveCallsArray failed:', error?.message || error);
-  }
-}
-
-async function pollCampaignUpdates(campaignId, poller) {
-  if (!io) return;
-  if (!poller || poller.running) return;
-  poller.running = true;
-
-  try {
-    const callLogs = await CallLog.find({ campaignId })
-      .sort({ updatedAt: -1 })
-      .lean();
-
-    const nextState = new Map();
-    const room = 'campaign-' + campaignId;
-
-    for (const log of callLogs) {
-      const formatted = formatCallLogEntry(log);
-      if (!formatted) continue;
-      const key = formatted.uniqueId || formatted.id;
-      if (!key) continue;
-
-      const serialized = JSON.stringify(formatted);
-      nextState.set(key, serialized);
-
-      const previous = poller.lastState.get(key);
-      if (previous !== serialized) {
-        console.log(`📤 [SOCKET.IO] Emitting call-transcript-update for campaign ${campaignId}, uniqueId: ${formatted.uniqueId || formatted.id}`);
-        io.to(room).emit('call-transcript-update', {
-          campaignId: String(campaignId),
-          uniqueId: formatted.uniqueId || formatted.id,
-          type: 'upsert',
-          call: formatted,
-        });
-      }
+// Stop polling for a uniqueId
+function stopUniqueIdPoller(socketId) {
+  const poller = uniqueIdPollers.get(socketId);
+  if (poller) {
+    if (poller.timer) {
+      clearInterval(poller.timer);
     }
-
-    // Detect removed calls
-    for (const [key] of poller.lastState.entries()) {
-      if (!nextState.has(key)) {
-        io.to(room).emit('call-transcript-update', {
-          campaignId: String(campaignId),
-          uniqueId: key,
-          type: 'remove',
-        });
-      }
-    }
-
-    poller.lastState = nextState;
-    
-    // Also emit array of all active calls
-    await emitActiveCallsArray(campaignId);
-  } catch (error) {
-    console.error('[wsServer] pollCampaignUpdates failed:', error?.message || error);
-  } finally {
-    poller.running = false;
+    uniqueIdPollers.delete(socketId);
+    console.log(`🛑 [SOCKET.IO] Stopped poller for socket: ${socketId}`);
   }
 }
 
-// Start Kafka consumer for transcript updates to reduce database polling
-async function startTranscriptConsumer() {
-  if (transcriptConsumerRunning) {
-    console.log('⚠️ [WS-KAFKA] Transcript consumer already running');
-    return;
-  }
 
-  try {
-    await ensureTopics(['call-transcript-update']);
-    const consumer = await getConsumer('ws-transcript-consumer-group');
-    
-    await consumer.subscribe({
-      topic: 'call-transcript-update',
-      fromBeginning: false
-    });
-    
-    console.log('✅ [WS-KAFKA] Subscribed to call-transcript-update topic');
-    
-    await consumer.run({
-      eachMessage: async ({ topic, partition, message }) => {
-        try {
-          const update = JSON.parse(message.value.toString());
-          const { campaignId, uniqueId, transcript, mobile, status, isActive } = update;
-          
-          if (!campaignId) return;
-          
-          // Emit active calls array when transcript updates
-          await emitActiveCallsArray(campaignId);
-          
-          // Also emit individual update for backward compatibility
-          if (io) {
-            const room = 'campaign-' + campaignId;
-            io.to(room).emit('call-transcript-update', {
-              campaignId: String(campaignId),
-              uniqueId,
-              transcript,
-              mobile,
-              status,
-              isActive,
-              type: 'upsert'
-            });
-          }
-        } catch (error) {
-          console.error('[WS-KAFKA] Error processing transcript update:', error?.message || error);
-        }
-      },
-    });
-    
-    transcriptConsumerRunning = true;
-    console.log('✅ [WS-KAFKA] Transcript consumer started');
-  } catch (error) {
-    console.error('❌ [WS-KAFKA] Failed to start transcript consumer:', error?.message || error);
-    transcriptConsumerRunning = false;
-  }
-}
 
 function init(server) {
   try {
@@ -338,15 +247,11 @@ function init(server) {
       pingInterval: 25000
     });
     
-    console.log('✅ [SOCKET.IO] Campaign transcript WebSocket server initialized');
+    console.log('✅ [SOCKET.IO] Transcript WebSocket server initialized');
     console.log('   - Path: /socket.io/');
     console.log('   - Transports: websocket, polling');
     console.log('   - CORS: enabled for all origins');
-    
-    // Start Kafka consumer for transcript updates (non-blocking)
-    startTranscriptConsumer().catch(err => {
-      console.warn('⚠️ [WS-KAFKA] Failed to start transcript consumer (will use polling):', err?.message);
-    });
+    console.log('   - Events: start-transcript, stop-transcript');
   } catch (error) {
     console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
     throw error;
@@ -354,7 +259,8 @@ function init(server) {
   
   // Log all connection attempts
   io.engine.on('connection', (req) => {
-    console.log(`🔗 [SOCKET.IO] Connection attempt from ${req.socket.remoteAddress || 'unknown'}`);
+    const remoteAddress = req?.socket?.remoteAddress || req?.headers?.['x-forwarded-for'] || req?.connection?.remoteAddress || 'unknown';
+    console.log(`🔗 [SOCKET.IO] Connection attempt from ${remoteAddress}`);
   });
   
   io.engine.on('connection_error', (err) => {
@@ -377,49 +283,36 @@ function init(server) {
   io.on('connection', socket => {
     console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
     console.log(`   Transport: ${socket.conn?.transport?.name || 'unknown'}`);
-    socket.joinedCampaigns = new Set();
 
-    socket.on('join-campaign', async campaignId => {
-      if (!campaignId) {
-        console.warn(`⚠️ [SOCKET.IO] join-campaign called without campaignId`);
+    // Start tracking transcript for a uniqueId
+    socket.on('start-transcript', async uniqueId => {
+      if (!uniqueId) {
+        socket.emit('error', { message: 'uniqueId is required' });
         return;
       }
-      console.log(`📥 [SOCKET.IO] Client ${socket.id} joining campaign: ${campaignId}`);
-      const room = 'campaign-' + campaignId;
-      socket.join(room);
-      if (!socket.joinedCampaigns.has(campaignId)) {
-        socket.joinedCampaigns.add(campaignId);
-        ensureCampaignPoller(campaignId);
-        console.log(`✅ [SOCKET.IO] Started poller for campaign: ${campaignId}`);
-      }
-      await emitCampaignSnapshot(socket, campaignId);
-      console.log(`📤 [SOCKET.IO] Sent initial snapshot to ${socket.id} for campaign: ${campaignId}`);
+      
+      console.log(`📥 [SOCKET.IO] Client ${socket.id} started tracking transcript for uniqueId: ${uniqueId}`);
+      
+      // Stop any existing poller for this socket
+      stopUniqueIdPoller(socket.id);
+      
+      // Start new poller
+      startUniqueIdPoller(socket.id, uniqueId, socket);
+      
+      // Send initial transcript if available
+      await sendTranscriptUpdate(socket, uniqueId);
     });
 
-    socket.on('leave-campaign', campaignId => {
-      if (!campaignId) return;
-      socket.leave('campaign-' + campaignId);
-       if (socket.joinedCampaigns?.has(campaignId)) {
-        socket.joinedCampaigns.delete(campaignId);
-        releaseCampaignPoller(campaignId);
-      }
-    });
-
-    socket.on('get-campaign-transcripts', async payload => {
-      const { campaignId, limit } = typeof payload === 'object' ? payload : { campaignId: payload };
-      if (!campaignId) return;
-      await emitCampaignSnapshot(socket, campaignId, {
-        limit: typeof limit === 'number' && limit > 0 ? limit : undefined,
-      });
+    // Stop tracking transcript
+    socket.on('stop-transcript', () => {
+      console.log(`🛑 [SOCKET.IO] Client ${socket.id} stopped tracking transcript`);
+      stopUniqueIdPoller(socket.id);
+      socket.emit('transcript-stopped', { message: 'Transcript tracking stopped' });
     });
 
     socket.on('disconnect', () => {
       console.log(`🔌 [SOCKET.IO] Client disconnected: ${socket.id}`);
-      if (!socket.joinedCampaigns) return;
-      for (const campaignId of socket.joinedCampaigns) {
-        releaseCampaignPoller(campaignId);
-      }
-      socket.joinedCampaigns.clear();
+      stopUniqueIdPoller(socket.id);
     });
   });
 }
@@ -432,21 +325,26 @@ function broadcastCampaignEvent(campaignId, event, payload) {
 
 function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
   if (!io) return;
-  const room = 'campaign-' + campaignId;
-  const formattedLog = formatCallLogEntry(callLog);
-  io.to(room).emit('call-status', { uniqueId, status, callLog: formattedLog });
-  if (formattedLog) {
-    io.to(room).emit('call-transcript-update', {
-      campaignId: String(campaignId),
-      call: formattedLog,
-      uniqueId,
-      status,
-    });
-    
-    // Also emit updated array of all active calls
-    emitActiveCallsArray(campaignId).catch(err => {
-      console.error('[wsServer] Error emitting active calls array:', err?.message);
-    });
+  // Find all sockets tracking this uniqueId and send update
+  for (const [socketId, poller] of uniqueIdPollers.entries()) {
+    if (poller.uniqueId === uniqueId) {
+      const socket = io.sockets.sockets.get(socketId);
+      if (socket && socket.connected) {
+        const formattedLog = formatCallLogEntry(callLog);
+        if (formattedLog) {
+          socket.emit('transcript-update', {
+            uniqueId,
+            found: true,
+            call: formattedLog,
+            transcript: formattedLog.transcript,
+            mobile: formattedLog.mobile,
+            status: formattedLog.status,
+            isActive: formattedLog.metadata?.isActive || false,
+            updatedAt: formattedLog.updatedAt
+          });
+        }
+      }
+    }
   }
 }
 
@@ -456,10 +354,10 @@ function getStatus() {
   }
   
   const connectedClients = io.sockets.sockets.size;
-  const activePollers = campaignPollers.size;
-  const pollerDetails = Array.from(campaignPollers.entries()).map(([campaignId, poller]) => ({
-    campaignId,
-    refCount: poller.refCount,
+  const activePollers = uniqueIdPollers.size;
+  const pollerDetails = Array.from(uniqueIdPollers.entries()).map(([socketId, poller]) => ({
+    socketId,
+    uniqueId: poller.uniqueId,
     running: poller.running
   }));
   
@@ -471,4 +369,4 @@ function getStatus() {
   };
 }
 
-module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot, getStatus, emitActiveCallsArray, startTranscriptConsumer };
+module.exports = { init, broadcastCampaignEvent, broadcastCallEvent, buildCampaignTranscriptSnapshot, getStatus };
