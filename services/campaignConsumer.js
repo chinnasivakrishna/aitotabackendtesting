@@ -48,7 +48,7 @@ async function handleStartCampaign(command) {
   
   // Use atomic update to set running state (only if not already running)
   // This prevents race conditions if multiple start commands arrive simultaneously
-  const campaign = await Campaign.findOneAndUpdate(
+  let campaign = await Campaign.findOneAndUpdate(
     {
       _id: campaignId,
       isRunning: false // Only update if not already running
@@ -68,14 +68,38 @@ async function handleStartCampaign(command) {
 
   // If update returned null, campaign doesn't exist or was already running
   if (!campaign) {
-    // Check if campaign exists
-    const exists = await Campaign.findById(campaignId);
-    if (!exists) {
+    // Check if campaign exists and get its current state
+    const currentState = await Campaign.findById(campaignId).lean();
+    if (!currentState) {
       throw new Error(`Campaign ${campaignId} not found`);
     }
-    // Campaign exists but isRunning was true (already running)
-    console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running, skipping duplicate start command`);
-    return; // Don't throw - allow offset to be committed
+    // Log the actual state for debugging
+    console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} atomic update failed. Current state:`, {
+      isRunning: currentState.isRunning,
+      status: currentState.status,
+      updatedAt: currentState.updatedAt
+    });
+    
+    if (currentState.isRunning) {
+      console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} is already running, skipping duplicate start command`);
+      return; // Don't throw - allow offset to be committed
+    } else {
+      // This shouldn't happen, but if isRunning is false and update failed, retry once
+      console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} update failed despite isRunning=false, retrying...`);
+      const retryCampaign = await Campaign.findOneAndUpdate(
+        { _id: campaignId, isRunning: false },
+        { $set: { isRunning: true, status: 'running', updatedAt: new Date() } },
+        { new: true }
+      );
+      if (!retryCampaign) {
+        console.error(`❌ [KAFKA-CONSUMER] Retry also failed for campaign ${campaignId}`);
+        return;
+      }
+      // Use retry result - reassign campaign variable
+      campaign = retryCampaign;
+      console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} marked as running on retry, proceeding with execution`);
+      // Continue with campaign processing below (campaign is now set)
+    }
   }
 
   console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} marked as running, proceeding with execution`);
@@ -196,20 +220,32 @@ async function handleCall(campaign, contact, agent) {
 
 async function handleStopCampaign(command) {
   const { campaignId } = command;
-  const campaign = await Campaign.findById(campaignId);
+  
+  // Use atomic update to ensure stop is applied
+  const campaign = await Campaign.findByIdAndUpdate(
+    campaignId,
+    {
+      $set: {
+        status: 'stop',
+        isRunning: false,
+        updatedAt: new Date()
+      }
+    },
+    { new: true }
+  );
+  
   if (!campaign) {
     throw new Error(`Campaign ${campaignId} not found`);
   }
   
-  campaign.status = 'stop';
-  campaign.isRunning = false;
-  campaign.updatedAt = new Date();
-  await campaign.save();
+  console.log(`🛑 [KAFKA-CONSUMER] Campaign ${campaignId} stopped. State:`, {
+    isRunning: campaign.isRunning,
+    status: campaign.status,
+    updatedAt: campaign.updatedAt
+  });
   
   wsServer.broadcastCampaignEvent(campaign._id, 'stop', campaign);
   kafkaService.send('campaign-status', { campaignId: campaign._id, status: 'stop' });
-  
-  console.log(`🛑 [KAFKA-CONSUMER] Campaign ${campaignId} stopped`);
 }
 
 async function handlePauseCampaign(command) {
