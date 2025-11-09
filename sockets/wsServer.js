@@ -1,10 +1,10 @@
-const socketio = require('socket.io');
+const WebSocket = require('ws');
 const mongoose = require('mongoose');
 const CallLog = require('../models/CallLog');
 const Campaign = require('../models/Campaign');
 
-let io = null;
-const uniqueIdPollers = new Map(); // socketId -> { uniqueId, timer, running, lastTranscript }
+let wss = null;
+const uniqueIdPollers = new Map(); // connectionId -> { uniqueId, timer, running, lastTranscript, ws }
 const DEFAULT_POLL_INTERVAL_MS = 2000; // Poll every 2 seconds for transcript updates
 
 function toPlain(doc) {
@@ -129,29 +129,16 @@ async function buildCampaignTranscriptSnapshot(campaignId, { limit = 200 } = {})
   };
 }
 
-async function emitCampaignSnapshot(socket, campaignId, options = {}) {
-  try {
-    const snapshot = await buildCampaignTranscriptSnapshot(campaignId, options);
-    socket.emit('campaign-transcripts', snapshot);
-  } catch (error) {
-    console.error('[wsServer] Failed to emit campaign snapshot:', error?.message || error);
-    socket.emit('campaign-transcripts-error', {
-      campaignId,
-      message: error?.message || 'Failed to fetch campaign transcripts',
-    });
-  }
-}
-
-
 // Send transcript update for a specific uniqueId
-async function sendTranscriptUpdate(socket, uniqueId) {
+async function sendTranscriptUpdate(ws, uniqueId) {
   try {
     const callLog = await CallLog.findOne({ 
       'metadata.customParams.uniqueid': uniqueId 
     }).lean();
 
     if (!callLog) {
-      socket.emit('transcript-update', {
+      sendMessage(ws, {
+        event: 'transcript-update',
         uniqueId,
         found: false,
         message: 'Call log not found'
@@ -161,7 +148,8 @@ async function sendTranscriptUpdate(socket, uniqueId) {
 
     const formatted = formatCallLogEntry(callLog);
     if (formatted) {
-      socket.emit('transcript-update', {
+      sendMessage(ws, {
+        event: 'transcript-update',
         uniqueId,
         found: true,
         call: formatted,
@@ -174,28 +162,44 @@ async function sendTranscriptUpdate(socket, uniqueId) {
     }
   } catch (error) {
     console.error('[wsServer] sendTranscriptUpdate failed:', error?.message || error);
-    socket.emit('error', { message: 'Failed to fetch transcript', error: error?.message });
+    sendMessage(ws, {
+      event: 'error',
+      message: 'Failed to fetch transcript',
+      error: error?.message
+    });
+  }
+}
+
+// Helper to send WebSocket message
+function sendMessage(ws, data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try {
+      ws.send(JSON.stringify(data));
+    } catch (error) {
+      console.error('[wsServer] Error sending message:', error?.message);
+    }
   }
 }
 
 // Start polling for a uniqueId
-function startUniqueIdPoller(socketId, uniqueId, socket) {
+function startUniqueIdPoller(connectionId, uniqueId, ws) {
   // Stop existing poller if any
-  stopUniqueIdPoller(socketId);
+  stopUniqueIdPoller(connectionId);
   
   const poller = {
     uniqueId,
+    ws,
     running: false,
     timer: null,
     lastTranscript: null
   };
 
   const poll = async () => {
-    if (poller.running || !socket.connected) return;
+    if (poller.running || ws.readyState !== WebSocket.OPEN) return;
     poller.running = true;
 
     try {
-      await sendTranscriptUpdate(socket, uniqueId);
+      await sendTranscriptUpdate(ws, uniqueId);
     } catch (error) {
       console.error(`[wsServer] Poll error for ${uniqueId}:`, error?.message);
     } finally {
@@ -208,208 +212,169 @@ function startUniqueIdPoller(socketId, uniqueId, socket) {
   
   // Then poll at intervals
   poller.timer = setInterval(() => {
-    if (socket.connected) {
+    if (ws.readyState === WebSocket.OPEN) {
       poll();
     } else {
-      stopUniqueIdPoller(socketId);
+      stopUniqueIdPoller(connectionId);
     }
   }, DEFAULT_POLL_INTERVAL_MS);
 
-  uniqueIdPollers.set(socketId, poller);
-  console.log(`✅ [SOCKET.IO] Started poller for uniqueId: ${uniqueId}, socket: ${socketId}`);
+  uniqueIdPollers.set(connectionId, poller);
+  console.log(`✅ [WEBSOCKET] Started poller for uniqueId: ${uniqueId}, connection: ${connectionId}`);
 }
 
 // Stop polling for a uniqueId
-function stopUniqueIdPoller(socketId) {
-  const poller = uniqueIdPollers.get(socketId);
+function stopUniqueIdPoller(connectionId) {
+  const poller = uniqueIdPollers.get(connectionId);
   if (poller) {
     if (poller.timer) {
       clearInterval(poller.timer);
     }
-    uniqueIdPollers.delete(socketId);
-    console.log(`🛑 [SOCKET.IO] Stopped poller for socket: ${socketId}`);
+    uniqueIdPollers.delete(connectionId);
+    console.log(`🛑 [WEBSOCKET] Stopped poller for connection: ${connectionId}`);
   }
 }
-
-
 
 function init(server) {
   try {
-    io = socketio(server, { 
-      cors: { 
-        origin: '*',
-        methods: ['GET', 'POST'],
-        credentials: true
-      },
-      transports: ['websocket', 'polling'],
-      allowEIO3: true, // Support older Socket.IO clients
-      pingTimeout: 60000,
-      pingInterval: 25000,
-      // Additional options for production stability
-      maxHttpBufferSize: 1e8, // 100MB
-      allowRequest: (req, callback) => {
-        // Allow all connections
-        callback(null, true);
-      }
+    // Create WebSocket server on /transcript path
+    wss = new WebSocket.Server({ 
+      server,
+      path: '/transcript'
     });
     
-    console.log('✅ [SOCKET.IO] Transcript WebSocket server initialized');
-    console.log('   - Path: /socket.io/');
-    console.log('   - Transports: websocket, polling');
-    console.log('   - CORS: enabled for all origins');
+    console.log('✅ [WEBSOCKET] Transcript WebSocket server initialized');
+    console.log('   - Path: /transcript');
     console.log('   - Events: start-transcript, stop-transcript');
     
-    // Global error handler
-    io.engine.on('error', (err) => {
-      console.error('❌ [SOCKET.IO] Engine error:', err?.message || err);
-    });
-  } catch (error) {
-    console.error('❌ [SOCKET.IO] Failed to initialize:', error?.message || error);
-    console.error('   Stack:', error?.stack);
-    throw error;
-  }
-  
-  // Log all connection attempts (with better error handling)
-  io.engine.on('connection', (req) => {
-    try {
-      const remoteAddress = req?.socket?.remoteAddress || 
-                           req?.headers?.['x-forwarded-for'] || 
-                           req?.connection?.remoteAddress || 
-                           req?.socket?.remoteAddress || 
-                           'unknown';
-      console.log(`🔗 [SOCKET.IO] Connection attempt from ${remoteAddress}`);
-    } catch (err) {
-      console.log(`🔗 [SOCKET.IO] Connection attempt from unknown (error getting address: ${err?.message})`);
-    }
-  });
-  
-  io.engine.on('connection_error', (err) => {
-    console.error('❌ [SOCKET.IO] Engine connection error:', err?.message || err);
-    console.error('   Error details:', {
-      type: err?.type,
-      description: err?.description,
-      context: err?.context,
-      code: err?.code
-    });
-  });
-
-  io.engine.on('upgrade', () => {
-    console.log('⬆️ [SOCKET.IO] Transport upgraded to WebSocket');
-  });
-
-  io.engine.on('upgradeError', (err) => {
-    console.error('❌ [SOCKET.IO] Upgrade error (falling back to polling):', err?.message || err);
-  });
-
-  io.on('connection', socket => {
-    try {
-      console.log(`🔌 [SOCKET.IO] Client connected: ${socket.id}`);
-      console.log(`   Transport: ${socket.conn?.transport?.name || 'unknown'}`);
-
-      // Start tracking transcript for a uniqueId
-      socket.on('start-transcript', async uniqueId => {
-        try {
-          if (!uniqueId) {
-            socket.emit('error', { message: 'uniqueId is required' });
-            return;
-          }
-          
-          console.log(`📥 [SOCKET.IO] Client ${socket.id} started tracking transcript for uniqueId: ${uniqueId}`);
-          
-          // Stop any existing poller for this socket
-          stopUniqueIdPoller(socket.id);
-          
-          // Start new poller
-          startUniqueIdPoller(socket.id, uniqueId, socket);
-          
-          // Send initial transcript if available
-          await sendTranscriptUpdate(socket, uniqueId);
-        } catch (error) {
-          console.error(`❌ [SOCKET.IO] Error in start-transcript:`, error?.message || error);
-          socket.emit('error', { message: 'Failed to start transcript tracking', error: error?.message });
-        }
-      });
-
-      // Stop tracking transcript
-      socket.on('stop-transcript', () => {
-        try {
-          console.log(`🛑 [SOCKET.IO] Client ${socket.id} stopped tracking transcript`);
-          stopUniqueIdPoller(socket.id);
-          socket.emit('transcript-stopped', { message: 'Transcript tracking stopped' });
-        } catch (error) {
-          console.error(`❌ [SOCKET.IO] Error in stop-transcript:`, error?.message || error);
-        }
-      });
-
-      socket.on('disconnect', (reason) => {
-        try {
-          console.log(`🔌 [SOCKET.IO] Client disconnected: ${socket.id}, reason: ${reason}`);
-          stopUniqueIdPoller(socket.id);
-        } catch (error) {
-          console.error(`❌ [SOCKET.IO] Error in disconnect handler:`, error?.message || error);
-        }
-      });
-
-      // Handle connection errors
-      socket.on('error', (error) => {
-        console.error(`❌ [SOCKET.IO] Socket error for ${socket.id}:`, error?.message || error);
-      });
-
+    wss.on('connection', (ws, req) => {
+      const connectionId = `conn_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const remoteAddress = req.socket?.remoteAddress || req.headers?.['x-forwarded-for'] || 'unknown';
+      
+      console.log(`🔌 [WEBSOCKET] Client connected: ${connectionId} from ${remoteAddress}`);
+      
+      // Store connection ID on ws object
+      ws.connectionId = connectionId;
+      
       // Send connection confirmation
-      socket.emit('connected', { 
-        socketId: socket.id,
+      sendMessage(ws, {
+        event: 'connected',
+        connectionId,
         message: 'Connected to transcript WebSocket server',
         events: ['start-transcript', 'stop-transcript']
       });
-    } catch (error) {
-      console.error(`❌ [SOCKET.IO] Error setting up socket connection:`, error?.message || error);
-      if (socket && socket.connected) {
-        socket.emit('error', { message: 'Connection setup failed', error: error?.message });
-      }
-    }
-  });
+      
+      // Handle incoming messages
+      ws.on('message', async (message) => {
+        try {
+          const data = JSON.parse(message.toString());
+          
+          if (data.event === 'start-transcript') {
+            const uniqueId = data.uniqueId || data.data;
+            if (!uniqueId) {
+              sendMessage(ws, {
+                event: 'error',
+                message: 'uniqueId is required'
+              });
+              return;
+            }
+            
+            console.log(`📥 [WEBSOCKET] Client ${connectionId} started tracking transcript for uniqueId: ${uniqueId}`);
+            
+            // Stop any existing poller for this connection
+            stopUniqueIdPoller(connectionId);
+            
+            // Start new poller
+            startUniqueIdPoller(connectionId, uniqueId, ws);
+            
+            // Send initial transcript if available
+            await sendTranscriptUpdate(ws, uniqueId);
+            
+          } else if (data.event === 'stop-transcript') {
+            console.log(`🛑 [WEBSOCKET] Client ${connectionId} stopped tracking transcript`);
+            stopUniqueIdPoller(connectionId);
+            sendMessage(ws, {
+              event: 'transcript-stopped',
+              message: 'Transcript tracking stopped'
+            });
+          } else {
+            sendMessage(ws, {
+              event: 'error',
+              message: `Unknown event: ${data.event}`
+            });
+          }
+        } catch (error) {
+          console.error(`❌ [WEBSOCKET] Error handling message:`, error?.message || error);
+          sendMessage(ws, {
+            event: 'error',
+            message: 'Invalid message format',
+            error: error?.message
+          });
+        }
+      });
+      
+      // Handle connection close
+      ws.on('close', (code, reason) => {
+        console.log(`🔌 [WEBSOCKET] Client disconnected: ${connectionId}, code: ${code}, reason: ${reason || 'unknown'}`);
+        stopUniqueIdPoller(connectionId);
+      });
+      
+      // Handle errors
+      ws.on('error', (error) => {
+        console.error(`❌ [WEBSOCKET] Connection error for ${connectionId}:`, error?.message || error);
+        stopUniqueIdPoller(connectionId);
+      });
+    });
+    
+    wss.on('error', (error) => {
+      console.error('❌ [WEBSOCKET] Server error:', error?.message || error);
+    });
+    
+  } catch (error) {
+    console.error('❌ [WEBSOCKET] Failed to initialize:', error?.message || error);
+    console.error('   Stack:', error?.stack);
+    throw error;
+  }
 }
 
 function broadcastCampaignEvent(campaignId, event, payload) {
-  if (!io) return;
-  const room = 'campaign-' + campaignId;
-  io.to(room).emit('campaign-status', { event, ...payload });
+  // Not used with native WebSocket - kept for compatibility
+  console.log(`[WEBSOCKET] broadcastCampaignEvent called (not implemented for native WebSocket): ${campaignId}, ${event}`);
 }
 
 function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
-  if (!io) return;
-  // Find all sockets tracking this uniqueId and send update
-  for (const [socketId, poller] of uniqueIdPollers.entries()) {
-    if (poller.uniqueId === uniqueId) {
-      const socket = io.sockets.sockets.get(socketId);
-      if (socket && socket.connected) {
-        const formattedLog = formatCallLogEntry(callLog);
-        if (formattedLog) {
-          socket.emit('transcript-update', {
-            uniqueId,
-            found: true,
-            call: formattedLog,
-            transcript: formattedLog.transcript,
-            mobile: formattedLog.mobile,
-            status: formattedLog.status,
-            isActive: formattedLog.metadata?.isActive || false,
-            updatedAt: formattedLog.updatedAt
-          });
-        }
+  if (!wss) return;
+  
+  // Find all connections tracking this uniqueId and send update
+  for (const [connectionId, poller] of uniqueIdPollers.entries()) {
+    if (poller.uniqueId === uniqueId && poller.ws && poller.ws.readyState === WebSocket.OPEN) {
+      const formattedLog = formatCallLogEntry(callLog);
+      if (formattedLog) {
+        sendMessage(poller.ws, {
+          event: 'transcript-update',
+          uniqueId,
+          found: true,
+          call: formattedLog,
+          transcript: formattedLog.transcript,
+          mobile: formattedLog.mobile,
+          status: formattedLog.status,
+          isActive: formattedLog.metadata?.isActive || false,
+          updatedAt: formattedLog.updatedAt
+        });
       }
     }
   }
 }
 
 function getStatus() {
-  if (!io) {
+  if (!wss) {
     return { initialized: false, connectedClients: 0, activePollers: 0 };
   }
   
-  const connectedClients = io.sockets.sockets.size;
+  const connectedClients = wss.clients.size;
   const activePollers = uniqueIdPollers.size;
-  const pollerDetails = Array.from(uniqueIdPollers.entries()).map(([socketId, poller]) => ({
-    socketId,
+  const pollerDetails = Array.from(uniqueIdPollers.entries()).map(([connectionId, poller]) => ({
+    connectionId,
     uniqueId: poller.uniqueId,
     running: poller.running
   }));
