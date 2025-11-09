@@ -21,8 +21,10 @@ function broadcastCampaign(campaign, event) {
 exports.startCampaign = async (campaignId, { n, g, r, mode }) => {
   const campaign = await Campaign.findById(campaignId);
   if (!campaign) throw new Error('Not found');
-  await updateCampaignStatus(campaign, 'start');
-  broadcastCampaign(campaign, 'start');
+  
+  // Don't set isRunning here - let the Kafka consumer handle it atomically
+  // This prevents race conditions where the consumer sees it as already running
+  // broadcastCampaign(campaign, 'start'); // Don't broadcast until consumer confirms
   
   // Publish campaign start command to Kafka instead of processing directly
   const campaignCommand = {
@@ -38,6 +40,8 @@ exports.startCampaign = async (campaignId, { n, g, r, mode }) => {
   console.log(`📨 [KAFKA] Publishing campaign start command for campaign ${campaignId}`);
   await kafkaService.send('campaign-commands', campaignCommand);
   console.log(`✅ [KAFKA] Campaign start command published successfully`);
+  
+  // The Kafka consumer will handle setting isRunning and broadcasting
 };
 
 async function handleCall(campaign, contact, agent) {

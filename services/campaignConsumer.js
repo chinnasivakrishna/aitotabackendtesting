@@ -56,7 +56,6 @@ async function handleStartCampaign(command) {
     {
       $set: {
         isRunning: true,
-        status: 'running',
         updatedAt: new Date()
       }
     },
@@ -76,7 +75,6 @@ async function handleStartCampaign(command) {
     // Log the actual state for debugging
     console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} atomic update failed. Current state:`, {
       isRunning: currentState.isRunning,
-      status: currentState.status,
       updatedAt: currentState.updatedAt
     });
     
@@ -88,7 +86,7 @@ async function handleStartCampaign(command) {
       console.warn(`⚠️ [KAFKA-CONSUMER] Campaign ${campaignId} update failed despite isRunning=false, retrying...`);
       const retryCampaign = await Campaign.findOneAndUpdate(
         { _id: campaignId, isRunning: false },
-        { $set: { isRunning: true, status: 'running', updatedAt: new Date() } },
+        { $set: { isRunning: true, updatedAt: new Date() } },
         { new: true }
       );
       if (!retryCampaign) {
@@ -103,6 +101,10 @@ async function handleStartCampaign(command) {
   }
 
   console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} marked as running, proceeding with execution`);
+
+  // Broadcast start event now that we've successfully marked it as running
+  wsServer.broadcastCampaignEvent(campaign._id, 'start', campaign);
+  kafkaService.send('campaign-status', { campaignId: campaign._id, status: 'start' });
 
   // Resolve agent reference
   const agentRef = Array.isArray(campaign.agent) ? (campaign.agent[0] || null) : campaign.agent;
@@ -146,10 +148,16 @@ async function handleStartCampaign(command) {
   }
   
   // Update campaign status to stopped after all calls complete
-  campaign.status = 'stop';
-  campaign.isRunning = false;
-  campaign.updatedAt = new Date();
-  await campaign.save();
+  // Use atomic update to prevent race conditions
+  await Campaign.findByIdAndUpdate(
+    campaign._id,
+    {
+      $set: {
+        isRunning: false,
+        updatedAt: new Date()
+      }
+    }
+  );
   
   // Broadcast completion
   wsServer.broadcastCampaignEvent(campaign._id, 'stop', campaign);
@@ -222,11 +230,11 @@ async function handleStopCampaign(command) {
   const { campaignId } = command;
   
   // Use atomic update to ensure stop is applied
+  // Note: Campaign model may not have 'status' field, so we only update isRunning
   const campaign = await Campaign.findByIdAndUpdate(
     campaignId,
     {
       $set: {
-        status: 'stop',
         isRunning: false,
         updatedAt: new Date()
       }
@@ -240,7 +248,6 @@ async function handleStopCampaign(command) {
   
   console.log(`🛑 [KAFKA-CONSUMER] Campaign ${campaignId} stopped. State:`, {
     isRunning: campaign.isRunning,
-    status: campaign.status,
     updatedAt: campaign.updatedAt
   });
   
