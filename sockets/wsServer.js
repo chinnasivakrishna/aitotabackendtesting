@@ -108,6 +108,102 @@ async function buildCampaignTranscriptSnapshot(campaignId, { limit = 200 } = {})
   const formattedCalls = callLogs.map(formatCallLogEntry);
   const activeCalls = formattedCalls.filter(call => call?.metadata?.isActive).length;
 
+  // Create a map of uniqueId to call log for quick lookup
+  const callsByUniqueId = new Map();
+  formattedCalls.forEach(call => {
+    if (call.uniqueId) {
+      callsByUniqueId.set(call.uniqueId, call);
+    }
+  });
+
+  // Get all contacts from campaign
+  const allContacts = Array.isArray(campaignDoc.contacts) ? campaignDoc.contacts : [];
+  const details = Array.isArray(campaignDoc.details) ? campaignDoc.details : [];
+  
+  // Create a map of contactId to contact for quick lookup
+  const contactsById = new Map();
+  allContacts.forEach(contact => {
+    if (contact) {
+      const id = contact._id ? String(contact._id) : null;
+      if (id) {
+        contactsById.set(id, contact);
+      }
+    }
+  });
+
+  // Build comprehensive contacts list: merge campaign contacts with call details
+  const allContactItems = [];
+  
+  // First, process all contacts from campaign.contacts
+  allContacts.forEach(contact => {
+    if (!contact) return;
+    
+    const contactId = contact._id ? String(contact._id) : null;
+    // Find if this contact has a detail entry (call attempt)
+    // Handle both ObjectId and string comparisons
+    const detail = details.find(d => {
+      if (!d || !d.contactId) return false;
+      const detailContactId = String(d.contactId);
+      return detailContactId === contactId;
+    });
+    
+    let callData = null;
+    if (detail && detail.uniqueId) {
+      callData = callsByUniqueId.get(detail.uniqueId);
+    }
+    
+    // If we have call data, use it; otherwise create a basic entry
+    if (callData) {
+      allContactItems.push({
+        ...callData,
+        contact: contact,
+        contactId: contactId
+      });
+    } else if (detail) {
+      // Contact has been attempted but no call log yet
+      allContactItems.push({
+        uniqueId: detail.uniqueId,
+        contactId: contactId,
+        contact: contact,
+        mobile: contact.phone || contact.mobile || contact.number || 'N/A',
+        status: detail.status || 'ringing',
+        leadStatus: detail.leadStatus || 'not_connected',
+        metadata: {
+          isActive: false
+        },
+        transcript: {
+          text: '',
+          segments: []
+        }
+      });
+    } else {
+      // Contact hasn't been called yet
+      allContactItems.push({
+        uniqueId: null,
+        contactId: contactId,
+        contact: contact,
+        mobile: contact.phone || contact.mobile || contact.number || 'N/A',
+        status: 'pending',
+        leadStatus: 'not_connected',
+        metadata: {
+          isActive: false
+        },
+        transcript: {
+          text: '',
+          segments: []
+        }
+      });
+    }
+  });
+
+  // Also include any calls that don't have a matching contact (edge case)
+  formattedCalls.forEach(call => {
+    const alreadyIncluded = allContactItems.some(item => item.uniqueId === call.uniqueId);
+    if (!alreadyIncluded) {
+      allContactItems.push(call);
+    }
+  });
+
   return {
     campaignId: String(campaignDoc._id),
     campaign: {
@@ -115,7 +211,7 @@ async function buildCampaignTranscriptSnapshot(campaignId, { limit = 200 } = {})
       name: campaignDoc.name,
       status: campaignDoc.status || (campaignDoc.isRunning ? 'running' : 'idle'),
       isRunning: !!campaignDoc.isRunning,
-      totalContacts: Array.isArray(campaignDoc.contacts) ? campaignDoc.contacts.length : 0,
+      totalContacts: allContacts.length,
       updatedAt: campaignDoc.updatedAt,
       createdAt: campaignDoc.createdAt,
     },
@@ -123,8 +219,9 @@ async function buildCampaignTranscriptSnapshot(campaignId, { limit = 200 } = {})
       callsReturned: formattedCalls.length,
       activeCalls,
       completedCalls: formattedCalls.filter(call => call?.status === 'completed').length,
+      totalContacts: allContacts.length,
     },
-    calls: formattedCalls,
+    calls: allContactItems,
     fetchedAt: new Date().toISOString(),
   };
 }
