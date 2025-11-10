@@ -5,6 +5,7 @@ const Campaign = require('../models/Campaign');
 
 let wss = null;
 const uniqueIdPollers = new Map(); // connectionId -> { uniqueId, timer, running, lastTranscript, ws }
+const campaignSubscriptions = new Map(); // connectionId -> { campaignId, ws }
 const DEFAULT_POLL_INTERVAL_MS = 2000; // Poll every 2 seconds for transcript updates
 
 function toPlain(doc) {
@@ -405,6 +406,34 @@ function init(server) {
               event: 'transcript-stopped',
               message: 'Transcript tracking stopped'
             });
+          } else if (data.event === 'subscribe-campaign') {
+            const campaignId = data.campaignId;
+            if (!campaignId) {
+              sendMessage(ws, {
+                event: 'error',
+                message: 'campaignId is required'
+              });
+              return;
+            }
+            
+            console.log(`📥 [WEBSOCKET] Client ${connectionId} subscribed to campaign: ${campaignId}`);
+            
+            // Store campaign subscription
+            campaignSubscriptions.set(connectionId, { campaignId, ws });
+            
+            sendMessage(ws, {
+              event: 'campaign-subscribed',
+              campaignId,
+              message: `Subscribed to campaign ${campaignId}`
+            });
+            
+          } else if (data.event === 'unsubscribe-campaign') {
+            console.log(`🛑 [WEBSOCKET] Client ${connectionId} unsubscribed from campaign`);
+            campaignSubscriptions.delete(connectionId);
+            sendMessage(ws, {
+              event: 'campaign-unsubscribed',
+              message: 'Unsubscribed from campaign'
+            });
           } else {
             sendMessage(ws, {
               event: 'error',
@@ -425,6 +454,7 @@ function init(server) {
       ws.on('close', (code, reason) => {
         console.log(`🔌 [WEBSOCKET] Client disconnected: ${connectionId}, code: ${code}, reason: ${reason || 'unknown'}`);
         stopUniqueIdPoller(connectionId);
+        campaignSubscriptions.delete(connectionId);
       });
       
       // Handle errors
@@ -446,17 +476,46 @@ function init(server) {
 }
 
 function broadcastCampaignEvent(campaignId, event, payload) {
-  // Not used with native WebSocket - kept for compatibility
-  console.log(`[WEBSOCKET] broadcastCampaignEvent called (not implemented for native WebSocket): ${campaignId}, ${event}`);
+  if (!wss) return;
+  
+  const campaignIdStr = String(campaignId);
+  
+  // Broadcast to all connections subscribed to this campaign
+  for (const [connectionId, subscription] of campaignSubscriptions.entries()) {
+    if (subscription.campaignId === campaignIdStr && subscription.ws && subscription.ws.readyState === WebSocket.OPEN) {
+      sendMessage(subscription.ws, {
+        event: 'campaign-update',
+        campaignId: campaignIdStr,
+        type: event,
+        data: payload,
+        timestamp: new Date().toISOString()
+      });
+    }
+  }
+  
+  console.log(`📢 [WEBSOCKET] Broadcast campaign event: ${event} for campaign ${campaignIdStr} to ${campaignSubscriptions.size} subscribers`);
 }
 
 function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
   if (!wss) return;
   
-  // Find all connections tracking this uniqueId and send update
+  const campaignIdStr = String(campaignId);
+  const formattedLog = callLog ? formatCallLogEntry(callLog) : null;
+  
+  // Prepare call update data
+  const callUpdate = {
+    uniqueId,
+    status,
+    campaignId: campaignIdStr,
+    mobile: formattedLog?.mobile || null,
+    leadStatus: formattedLog?.leadStatus || null,
+    isActive: formattedLog?.metadata?.isActive || false,
+    timestamp: new Date().toISOString()
+  };
+  
+  // 1. Send to connections tracking this specific uniqueId (for transcript updates)
   for (const [connectionId, poller] of uniqueIdPollers.entries()) {
     if (poller.uniqueId === uniqueId && poller.ws && poller.ws.readyState === WebSocket.OPEN) {
-      const formattedLog = formatCallLogEntry(callLog);
       if (formattedLog) {
         sendMessage(poller.ws, {
           event: 'transcript-update',
@@ -472,6 +531,18 @@ function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
       }
     }
   }
+  
+  // 2. Broadcast to all connections subscribed to this campaign (for live call status)
+  for (const [connectionId, subscription] of campaignSubscriptions.entries()) {
+    if (subscription.campaignId === campaignIdStr && subscription.ws && subscription.ws.readyState === WebSocket.OPEN) {
+      sendMessage(subscription.ws, {
+        event: 'call-update',
+        ...callUpdate
+      });
+    }
+  }
+  
+  console.log(`📢 [WEBSOCKET] Broadcast call event: ${status} for uniqueId ${uniqueId} in campaign ${campaignIdStr}`);
 }
 
 function getStatus() {
@@ -491,6 +562,7 @@ function getStatus() {
     initialized: true,
     connectedClients,
     activePollers,
+    campaignSubscriptions: campaignSubscriptions.size,
     pollerDetails
   };
 }
