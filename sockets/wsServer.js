@@ -141,12 +141,22 @@ async function buildCampaignTranscriptSnapshot(campaignId, { limit = 200 } = {})
     
     const contactId = contact._id ? String(contact._id) : null;
     // Find if this contact has a detail entry (call attempt)
+    // Get the LATEST detail entry (most recent call attempt) by sorting by time
     // Handle both ObjectId and string comparisons
-    const detail = details.find(d => {
-      if (!d || !d.contactId) return false;
-      const detailContactId = String(d.contactId);
-      return detailContactId === contactId;
-    });
+    const contactDetails = details
+      .filter(d => {
+        if (!d || !d.contactId) return false;
+        const detailContactId = String(d.contactId);
+        return detailContactId === contactId;
+      })
+      .sort((a, b) => {
+        // Sort by time descending (most recent first)
+        const timeA = a.time ? new Date(a.time).getTime() : 0;
+        const timeB = b.time ? new Date(b.time).getTime() : 0;
+        return timeB - timeA;
+      });
+    
+    const detail = contactDetails[0] || null; // Get the most recent detail
     
     let callData = null;
     if (detail && detail.uniqueId) {
