@@ -509,6 +509,22 @@ function init(server) {
               message: `Subscribed to campaign ${campaignId}`
             });
             
+            // Auto-send a lightweight snapshot on subscribe for immediate UI render
+            try {
+              const snapshot = await buildCampaignTranscriptSnapshot(campaignId, { limit: 200 });
+              sendMessage(ws, {
+                event: 'campaign-snapshot',
+                campaignId,
+                data: snapshot
+              });
+            } catch (snapErr) {
+              sendMessage(ws, {
+                event: 'error',
+                message: 'Failed to build campaign snapshot',
+                error: snapErr?.message
+              });
+            }
+            
           } else if (data.event === 'unsubscribe-campaign') {
             console.log(`🛑 [WEBSOCKET] Client ${connectionId} unsubscribed from campaign`);
             campaignSubscriptions.delete(connectionId);
@@ -516,6 +532,30 @@ function init(server) {
               event: 'campaign-unsubscribed',
               message: 'Unsubscribed from campaign'
             });
+          } else if (data.event === 'get-campaign-snapshot') {
+            const campaignId = data.campaignId;
+            const limit = Number.isFinite(data.limit) ? data.limit : 200;
+            if (!campaignId) {
+              sendMessage(ws, {
+                event: 'error',
+                message: 'campaignId is required'
+              });
+              return;
+            }
+            try {
+              const snapshot = await buildCampaignTranscriptSnapshot(campaignId, { limit });
+              sendMessage(ws, {
+                event: 'campaign-snapshot',
+                campaignId,
+                data: snapshot
+              });
+            } catch (e) {
+              sendMessage(ws, {
+                event: 'error',
+                message: 'Failed to build campaign snapshot',
+                error: e?.message
+              });
+            }
           } else {
             sendMessage(ws, {
               event: 'error',

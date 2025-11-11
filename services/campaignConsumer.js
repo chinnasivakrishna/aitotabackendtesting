@@ -289,6 +289,61 @@ async function monitorCampaignCompletion(campaignId, activeUniqueIds) {
     wsServer.broadcastCampaignEvent(campaignId, 'stop', { _id: campaignId });
     kafkaService.send('campaign-status', { campaignId, status: 'stop' }).catch(() => {});
     
+    // Persist campaign run summary into CampaignHistory (non-blocking)
+    (async () => {
+      try {
+        const CampaignHistory = require('../models/CampaignHistory');
+        // Build contacts summary from CallLogs
+        const logs = await CallLog.find({ campaignId }).lean();
+        const contacts = logs.map(l => ({
+          documentId: l._id ? String(l._id) : undefined,
+          number: l.mobile,
+          name: undefined,
+          leadStatus: l.leadStatus || null,
+          contactId: String(l.campaignId || '') || undefined,
+          time: l.createdAt ? new Date(l.createdAt).toISOString() : undefined,
+          status: l.metadata?.isActive ? 'ongoing' : (l.metadata?.callEndTime ? 'completed' : (l.leadStatus || 'not_connected')),
+          duration: typeof l.duration === 'number' ? l.duration : 0,
+          transcriptCount: l.metadata?.totalUpdates || 0,
+          whatsappMessageSent: !!l.metadata?.whatsappMessageSent,
+          whatsappRequested: !!l.metadata?.whatsappRequested
+        }));
+        const stats = {
+          totalContacts: contacts.length,
+          successfulCalls: contacts.filter(c => c.status === 'completed').length,
+          failedCalls: contacts.filter(c => c.status === 'not_connected' || c.status === 'failed').length,
+          totalCallDuration: contacts.reduce((a, c) => a + (c.duration || 0), 0)
+        };
+        stats.averageCallDuration = stats.totalContacts > 0 ? Math.round(stats.totalCallDuration / stats.totalContacts) : 0;
+        // Determine instance number
+        const existingCount = await CampaignHistory.countDocuments({ campaignId });
+        const instanceNumber = existingCount + 1;
+        const runId = `${String(campaignId)}-${Date.now()}`;
+        const now = new Date();
+        await CampaignHistory.create({
+          campaignId,
+          runId,
+          instanceNumber,
+          startTime: new Date(startTime).toISOString(),
+          endTime: now.toISOString(),
+          runTime: {
+            hours: Math.floor((now - startTime) / 3600000),
+            minutes: Math.floor(((now - startTime) % 3600000) / 60000),
+            seconds: Math.floor(((now - startTime) % 60000) / 1000)
+          },
+          status: 'completed',
+          contacts,
+          stats,
+          batchInfo: {
+            isIntermediate: false
+          }
+        });
+        console.log(`📝 [KAFKA-CONSUMER] CampaignHistory saved for campaign ${campaignId}`);
+      } catch (e) {
+        console.error(`[KAFKA-CONSUMER] Failed to save CampaignHistory for ${campaignId}:`, e?.message || e);
+      }
+    })().catch(() => {});
+    
     if (activeUniqueIds.size > 0) {
       console.warn(`⚠️ [KAFKA-CONSUMER] Timeout waiting for ${activeUniqueIds.size} calls to finish. Marking campaign as completed anyway.`);
     } else {
