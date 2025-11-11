@@ -155,139 +155,232 @@ async function handleStartCampaign(command, commitOffsetCallback = null) {
   // Track all uniqueIds for calls initiated in this campaign
   const activeUniqueIds = new Set();
   
-  for (const batch of contactBatches) {
+  // Process batches asynchronously (non-blocking)
+  processBatchesAsync(campaign, contactBatches, agent, activeUniqueIds, n, g, mode).catch(err => {
+    console.error(`[KAFKA-CONSUMER] Error processing batches for campaign ${campaignId}:`, err);
+  });
+  
+  // Start background monitoring for campaign completion (non-blocking)
+  monitorCampaignCompletion(campaign._id, activeUniqueIds).catch(err => {
+    console.error(`[KAFKA-CONSUMER] Error monitoring campaign completion:`, err);
+  });
+  
+  console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} batch processing started - running in background`);
+}
+
+// Non-blocking batch processing
+async function processBatchesAsync(campaign, contactBatches, agent, activeUniqueIds, n, g, mode) {
+  const campaignId = campaign._id;
+  
+  for (let batchIndex = 0; batchIndex < contactBatches.length; batchIndex++) {
+    const batch = contactBatches[batchIndex];
+    
     if (mode === 'series') {
+      // Series mode: process one at a time
       for (const contact of batch) {
-        const uniqueId = await handleCall(campaign, contact, agent, activeUniqueIds);
-        if (uniqueId) activeUniqueIds.add(uniqueId);
+        const uniqueId = handleCall(campaign, contact, agent, activeUniqueIds);
+        if (uniqueId) {
+          // Use setTimeout to add to set asynchronously (non-blocking)
+          setTimeout(() => {
+            activeUniqueIds.add(uniqueId);
+          }, 0);
+        }
+        // Small delay between calls in series mode
+        await new Promise(resolve => setTimeout(resolve, 100));
       }
     } else {
-      const uniqueIds = await Promise.all(batch.map(contact => handleCall(campaign, contact, agent, activeUniqueIds)));
-      uniqueIds.forEach(id => { if (id) activeUniqueIds.add(id); });
+      // Parallel mode: process all in batch simultaneously (non-blocking)
+      const callPromises = batch.map(contact => {
+        return Promise.resolve(handleCall(campaign, contact, agent, activeUniqueIds)).then(uniqueId => {
+          if (uniqueId) {
+            activeUniqueIds.add(uniqueId);
+          }
+          return uniqueId;
+        });
+      });
+      
+      // Don't await - let them run in parallel
+      Promise.all(callPromises).catch(err => {
+        console.error(`[KAFKA-CONSUMER] Error in parallel batch processing:`, err);
+      });
     }
     
-    // Wait for gap (G) between batches if specified
-    if (g && g > 0 && contactBatches.indexOf(batch) < contactBatches.length - 1) {
+    // Wait for gap (G) between batches if specified (non-blocking delay)
+    if (g && g > 0 && batchIndex < contactBatches.length - 1) {
       console.log(`⏳ [KAFKA-CONSUMER] Waiting ${g}s before next batch...`);
       await new Promise(resolve => setTimeout(resolve, g * 1000));
     }
   }
   
-  // Wait for all active calls to finish before marking campaign as completed
-  console.log(`⏳ [KAFKA-CONSUMER] Waiting for ${activeUniqueIds.size} active calls to finish for campaign ${campaignId}...`);
-  await waitForAllCallsToFinish(campaignId, activeUniqueIds);
-  
-  // Update campaign status to stopped after all calls complete
-  // Use atomic update to prevent race conditions
-  await Campaign.findByIdAndUpdate(
-    campaign._id,
-    {
-      $set: {
-        isRunning: false,
-        updatedAt: new Date()
-      }
-    }
-  );
-  
-  // Broadcast completion
-  wsServer.broadcastCampaignEvent(campaign._id, 'stop', campaign);
-  kafkaService.send('campaign-status', { campaignId: campaign._id, status: 'stop' });
-  
-  console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} completed successfully - all calls finished`);
+  console.log(`✅ [KAFKA-CONSUMER] All batches processed for campaign ${campaignId}`);
 }
 
-// Helper function to wait for all calls to finish
-async function waitForAllCallsToFinish(campaignId, uniqueIds) {
-  if (uniqueIds.size === 0) {
-    console.log(`✅ [KAFKA-CONSUMER] No active calls to wait for`);
-    return;
-  }
-  
+// Non-blocking campaign completion monitoring
+async function monitorCampaignCompletion(campaignId, activeUniqueIds) {
   const maxWaitTime = 30 * 60 * 1000; // 30 minutes max wait
   const checkInterval = 5000; // Check every 5 seconds
   const startTime = Date.now();
   
-  while (uniqueIds.size > 0 && (Date.now() - startTime) < maxWaitTime) {
-    // Check which calls are still active
-    const activeCalls = await CallLog.find({
-      campaignId,
-      'metadata.customParams.uniqueid': { $in: Array.from(uniqueIds) },
-      'metadata.isActive': true
-    }).lean();
+  // Wait a bit for calls to start
+  await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10s for initial calls
+  
+  while ((Date.now() - startTime) < maxWaitTime) {
+    // Check if campaign is still running
+    const campaign = await Campaign.findById(campaignId).lean();
+    if (!campaign || !campaign.isRunning) {
+      console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} stopped externally`);
+      break;
+    }
     
-    const stillActiveUniqueIds = new Set(
-      activeCalls.map(call => call.metadata?.customParams?.uniqueid).filter(Boolean)
-    );
-    
-    // Remove finished calls from tracking
-    for (const uniqueId of uniqueIds) {
-      if (!stillActiveUniqueIds.has(uniqueId)) {
-        uniqueIds.delete(uniqueId);
-        console.log(`✅ [KAFKA-CONSUMER] Call ${uniqueId} finished, ${uniqueIds.size} calls remaining`);
+    // Check which calls are still active (non-blocking query)
+    if (activeUniqueIds.size > 0) {
+      try {
+        const activeCalls = await CallLog.find({
+          campaignId,
+          'metadata.customParams.uniqueid': { $in: Array.from(activeUniqueIds) },
+          'metadata.isActive': true
+        }).select('metadata.customParams.uniqueid').lean();
+        
+        const stillActiveUniqueIds = new Set(
+          activeCalls.map(call => call.metadata?.customParams?.uniqueid).filter(Boolean)
+        );
+        
+        // Remove finished calls from tracking
+        for (const uniqueId of activeUniqueIds) {
+          if (!stillActiveUniqueIds.has(uniqueId)) {
+            activeUniqueIds.delete(uniqueId);
+            console.log(`✅ [KAFKA-CONSUMER] Call ${uniqueId} finished, ${activeUniqueIds.size} calls remaining`);
+          }
+        }
+        
+        // If no active calls left, mark campaign as completed
+        if (activeUniqueIds.size === 0) {
+          console.log(`✅ [KAFKA-CONSUMER] All calls finished for campaign ${campaignId}`);
+          break;
+        }
+      } catch (err) {
+        console.error(`[KAFKA-CONSUMER] Error checking active calls:`, err);
+      }
+    } else {
+      // No active calls to track, wait a bit more in case calls are still starting
+      await new Promise(resolve => setTimeout(resolve, checkInterval * 2));
+      if (activeUniqueIds.size === 0) {
+        break;
       }
     }
     
-    if (uniqueIds.size > 0) {
-      await new Promise(resolve => setTimeout(resolve, checkInterval));
-    }
+    // Wait before next check (non-blocking)
+    await new Promise(resolve => setTimeout(resolve, checkInterval));
   }
   
-  if (uniqueIds.size > 0) {
-    console.warn(`⚠️ [KAFKA-CONSUMER] Timeout waiting for ${uniqueIds.size} calls to finish. Marking campaign as completed anyway.`);
-  } else {
-    console.log(`✅ [KAFKA-CONSUMER] All calls finished for campaign ${campaignId}`);
+  // Mark campaign as completed (non-blocking)
+  try {
+    await Campaign.findByIdAndUpdate(
+      campaignId,
+      {
+        $set: {
+          isRunning: false,
+          updatedAt: new Date()
+        }
+      }
+    );
+    
+    // Broadcast completion (non-blocking)
+    wsServer.broadcastCampaignEvent(campaignId, 'stop', { _id: campaignId });
+    kafkaService.send('campaign-status', { campaignId, status: 'stop' }).catch(() => {});
+    
+    if (activeUniqueIds.size > 0) {
+      console.warn(`⚠️ [KAFKA-CONSUMER] Timeout waiting for ${activeUniqueIds.size} calls to finish. Marking campaign as completed anyway.`);
+    } else {
+      console.log(`✅ [KAFKA-CONSUMER] Campaign ${campaignId} completed successfully - all calls finished`);
+    }
+  } catch (err) {
+    console.error(`[KAFKA-CONSUMER] Error marking campaign as completed:`, err);
   }
 }
 
+// Non-blocking call handler with real-time status updates
 async function handleCall(campaign, contact, agent, activeUniqueIds = null) {
   const uniqueid = uuidv4();
   const phone = contact.phone;
+  const campaignId = campaign._id;
   
-  console.log(`📞 [KAFKA-CONSUMER] Initiating call for campaign ${campaign._id}, contact: ${phone}, agent: ${agent._id || agent.agentId}, provider: ${agent.serviceProvider}`);
+  console.log(`📞 [KAFKA-CONSUMER] Initiating call for campaign ${campaignId}, contact: ${phone}, agent: ${agent._id || agent.agentId}, provider: ${agent.serviceProvider}`);
   
   // Validate required fields
   if (!phone) {
     console.error(`❌ [KAFKA-CONSUMER] Missing phone number for contact:`, contact);
-    return;
+    return null;
   }
   
   if (!agent.serviceProvider) {
     console.error(`❌ [KAFKA-CONSUMER] Agent ${agent._id || agent.agentId} missing serviceProvider. Available fields:`, Object.keys(agent));
-    return;
+    return null;
   }
-  
-  let res;
+
+  // Immediately create initial detail entry with "ringing" status
+  const initialDetail = {
+    uniqueId: uniqueid,
+    contactId: contact._id || contact.id,
+    time: new Date(),
+    status: 'ringing',
+    runId: campaignId.toString()
+  };
+
+  // Save initial detail (non-blocking - fire and forget)
+  Campaign.findByIdAndUpdate(
+    campaignId,
+    {
+      $push: { details: initialDetail },
+      $set: { updatedAt: new Date() }
+    },
+    { new: false }
+  ).catch(err => console.error(`[KAFKA-CONSUMER] Error saving initial detail:`, err));
+
+  // Broadcast initial "ringing" status immediately
+  wsServer.broadcastCallEvent(campaignId, uniqueid, 'ringing', null, phone);
+  kafkaService.send('call-status', { campaignId, uniqueid, status: 'ringing', mobile: phone }).catch(() => {});
+
+  // Start non-blocking call initiation and status tracking
+  trackCallStatus(campaign, contact, agent, uniqueid, phone, activeUniqueIds).catch(err => {
+    console.error(`[KAFKA-CONSUMER] Error tracking call ${uniqueid}:`, err);
+  });
+
+  // Return immediately - don't wait for call to complete
+  return uniqueid;
+}
+
+// Non-blocking function to track call status in background
+async function trackCallStatus(campaign, contact, agent, uniqueid, phone, activeUniqueIds = null) {
+  const campaignId = campaign._id;
   let callInitiated = false;
+  let res;
+
   try {
+    // Initiate call (non-blocking)
     if (agent.serviceProvider === "c-zentrix" || agent.serviceProvider === "czentrix") {
       console.log(`📞 [KAFKA-CONSUMER] Calling via C-Zentrix: ${phone}`);
       if (!agent.callerId) {
-        console.error(`❌ [KAFKA-CONSUMER] Agent missing callerId for C-Zentrix call`);
         throw new Error('Agent missing callerId for C-Zentrix call');
       }
       res = await telephonyService.callCzentrix({
         phone: contact.phone,
         agent,
         contact,
-        campaignId: campaign._id,
+        campaignId: campaignId,
         uniqueid
       });
-      console.log(`✅ [KAFKA-CONSUMER] C-Zentrix call initiated. Response:`, res);
       callInitiated = true;
       
-      // Check if response indicates failure
       if (res && (res.error || res.status === 'failed')) {
         console.warn(`⚠️ [KAFKA-CONSUMER] C-Zentrix call failed:`, res.msg || res.message || res);
-        // Still wait for call log in case it gets created
       }
     } else if (agent.serviceProvider === "sanpbx" || agent.serviceProvider === "snapbx") {
       console.log(`📞 [KAFKA-CONSUMER] Calling via SANPBX: ${phone}`);
       if (!agent.callerId) {
-        console.error(`❌ [KAFKA-CONSUMER] Agent missing callerId for SANPBX call`);
         throw new Error('Agent missing callerId for SANPBX call');
       }
       if (!agent.accessToken) {
-        console.error(`❌ [KAFKA-CONSUMER] Agent missing accessToken for SANPBX call`);
         throw new Error('Agent missing accessToken for SANPBX call');
       }
       res = await telephonyService.callSanpbx({
@@ -296,89 +389,241 @@ async function handleCall(campaign, contact, agent, activeUniqueIds = null) {
         contact,
         uniqueid
       });
-      console.log(`✅ [KAFKA-CONSUMER] SANPBX call initiated. Response:`, res);
       callInitiated = true;
       
-      // Check if response indicates failure
       if (res && (res.error || res.status === 'failed')) {
         console.warn(`⚠️ [KAFKA-CONSUMER] SANPBX call failed:`, res.msg || res.message || res);
-        // Still wait for call log in case it gets created
       }
     } else {
-      console.error(`❌ [KAFKA-CONSUMER] Unknown service provider: ${agent.serviceProvider}. Expected: c-zentrix, czentrix, sanpbx, or snapbx`);
       throw new Error(`Unknown service provider: ${agent.serviceProvider}`);
     }
   } catch (error) {
     console.error(`❌ [KAFKA-CONSUMER] Error initiating call to ${phone}:`, error?.message || error);
-    console.error(`   Stack:`, error?.stack);
-    // Mark as failed but continue to check for call log (in case it was created before error)
     callInitiated = false;
   }
-  
-  // Wait for call log to be created (telephony service should create it)
+
+  // Non-blocking status polling with real-time updates
   let log = null;
   let waited = 0;
   const maxWait = 40000; // 40 seconds
+  const pollInterval = 2000; // Check every 2 seconds
+  let lastStatus = 'ringing';
+
   while (waited < maxWait) {
-    log = await CallLog.findOne({ "metadata.customParams.uniqueid": uniqueid });
+    // Check for call log (non-blocking query)
+    try {
+      log = await CallLog.findOne({ "metadata.customParams.uniqueid": uniqueid }).lean();
+    } catch (err) {
+      console.error(`[KAFKA-CONSUMER] Error querying call log:`, err);
+    }
+
     if (log) {
-      console.log(`✅ [KAFKA-CONSUMER] Call log found for ${phone}, uniqueid: ${uniqueid}`);
+      // Call log found - determine status
+      const isActive = log.metadata?.isActive || false;
+      const newStatus = isActive ? 'ongoing' : 'completed';
+      
+      // Only broadcast if status changed
+      if (newStatus !== lastStatus) {
+        lastStatus = newStatus;
+        console.log(`✅ [KAFKA-CONSUMER] Call log found for ${phone}, uniqueid: ${uniqueid}, status: ${newStatus}`);
+        
+        // Update detail in campaign
+        const detail = {
+          uniqueId: uniqueid,
+          contactId: contact._id || contact.id,
+          time: new Date(),
+          status: newStatus,
+          runId: campaignId.toString()
+        };
+        
+        if (log.leadStatus) {
+          detail.leadStatus = log.leadStatus;
+        }
+
+        // Update campaign detail (non-blocking)
+        Campaign.findByIdAndUpdate(
+          campaignId,
+          {
+            $set: {
+              'details.$[elem].status': newStatus,
+              'details.$[elem].leadStatus': log.leadStatus || undefined,
+              updatedAt: new Date()
+            }
+          },
+          {
+            arrayFilters: [{ 'elem.uniqueId': uniqueid }],
+            new: false
+          }
+        ).catch(err => console.error(`[KAFKA-CONSUMER] Error updating detail:`, err));
+
+        // Broadcast status update (non-blocking)
+        wsServer.broadcastCallEvent(campaignId, uniqueid, newStatus, log, phone);
+        kafkaService.send('call-status', { 
+          campaignId, 
+          uniqueid, 
+          status: newStatus, 
+          mobile: phone,
+          isActive,
+          leadStatus: log.leadStatus
+        }).catch(() => {});
+
+        // If call is active, add to tracking set
+        if (isActive && activeUniqueIds) {
+          activeUniqueIds.add(uniqueid);
+        }
+
+        // Publish transcript update if available (non-blocking)
+        if (log.transcript) {
+          kafkaService.send('call-transcript-update', {
+            campaignId,
+            uniqueId: uniqueid,
+            transcript: log.transcript,
+            mobile: phone,
+            status: isActive ? 'ongoing' : 'completed',
+            isActive
+          }).catch(() => {});
+        }
+
+        // If call is completed, stop polling
+        if (!isActive) {
+          break;
+        }
+      } else if (isActive && log.transcript) {
+        // Call is ongoing - check for transcript updates (non-blocking)
+        kafkaService.send('call-transcript-update', {
+          campaignId,
+          uniqueId: uniqueid,
+          transcript: log.transcript,
+          mobile: phone,
+          status: 'ongoing',
+          isActive: true
+        }).catch(() => {});
+      }
+    } else if (waited >= maxWait - pollInterval) {
+      // No log found after max wait - mark as not_connected
+      if (lastStatus !== 'not_connected') {
+        lastStatus = 'not_connected';
+        console.warn(`⚠️ [KAFKA-CONSUMER] Call log not found after ${maxWait/1000}s for ${phone}, uniqueid: ${uniqueid}. Marking as not_connected.`);
+        
+        // Update detail status to not_connected
+        Campaign.findByIdAndUpdate(
+          campaignId,
+          {
+            $set: {
+              'details.$[elem].status': 'not_connected',
+              updatedAt: new Date()
+            }
+          },
+          {
+            arrayFilters: [{ 'elem.uniqueId': uniqueid }],
+            new: false
+          }
+        ).catch(err => console.error(`[KAFKA-CONSUMER] Error updating detail to not_connected:`, err));
+
+        // Broadcast not_connected status
+        wsServer.broadcastCallEvent(campaignId, uniqueid, 'not_connected', null, phone);
+        kafkaService.send('call-status', { 
+          campaignId, 
+          uniqueid, 
+          status: 'not_connected', 
+          mobile: phone 
+        }).catch(() => {});
+      }
       break;
     }
-    await new Promise(res => setTimeout(res, 2000));
-    waited += 2000;
+
+    // Wait before next poll (non-blocking)
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+    waited += pollInterval;
   }
-  
-  if (!log) {
-    console.warn(`⚠️ [KAFKA-CONSUMER] Call log not found after ${maxWait/1000}s for ${phone}, uniqueid: ${uniqueid}. Call may have failed to initiate.`);
-  }
-  
-  let status = "ringing";
-  if (log && log.isActive) status = "ongoing";
-  else if (log && !log.isActive) status = "completed";
-  else if (!log) status = "failed"; // Mark as failed if no log was created
-  
-  // Persist under the defined `details` array in Campaign schema
-  const detail = {
-    uniqueId: uniqueid,
-    contactId: contact._id || contact.id,
-    time: new Date(),
-    status,
-    runId: campaign._id.toString()
-  };
-  
-  if (log && log.leadStatus) {
-    detail.leadStatus = log.leadStatus;
-  }
-  
-  await Campaign.findByIdAndUpdate(
-    campaign._id,
-    {
-      $push: { details: detail },
-      $set: { updatedAt: new Date() }
-    },
-    { new: false }
-  );
-  
-  kafkaService.send('call-status', { campaignId: campaign._id, uniqueid, status });
-  wsServer.broadcastCallEvent(campaign._id, uniqueid, status, log);
-  
-  // Publish transcript update via Kafka to reduce server load
-  if (log && log.transcript) {
-    kafkaService.send('call-transcript-update', {
-      campaignId: campaign._id,
-      uniqueId: uniqueid,
-      transcript: log.transcript,
-      mobile: phone,
-      status: log.isActive ? 'ongoing' : 'completed',
-      isActive: log.isActive || false
+
+  // Continue monitoring active calls for status changes
+  if (log && log.metadata?.isActive) {
+    monitorActiveCall(campaignId, uniqueid, phone, activeUniqueIds).catch(err => {
+      console.error(`[KAFKA-CONSUMER] Error monitoring active call ${uniqueid}:`, err);
     });
   }
+}
+
+// Monitor active calls for status changes (completion, transcript updates)
+async function monitorActiveCall(campaignId, uniqueid, phone, activeUniqueIds = null) {
+  const checkInterval = 5000; // Check every 5 seconds
+  let lastTranscript = '';
   
-  console.log(`📊 [KAFKA-CONSUMER] Call detail saved for ${phone}: status=${status}, uniqueid=${uniqueid}`);
-  
-  // Return uniqueId so it can be tracked for completion
-  return uniqueid;
+  while (true) {
+    try {
+      const log = await CallLog.findOne({ "metadata.customParams.uniqueid": uniqueid }).lean();
+      
+      if (!log) {
+        // Call log disappeared - mark as completed
+        break;
+      }
+
+      const isActive = log.metadata?.isActive || false;
+      
+      if (!isActive) {
+        // Call completed
+        const leadStatus = log.leadStatus || 'not_connected';
+        
+        // Update campaign detail
+        Campaign.findByIdAndUpdate(
+          campaignId,
+          {
+            $set: {
+              'details.$[elem].status': 'completed',
+              'details.$[elem].leadStatus': leadStatus,
+              updatedAt: new Date()
+            }
+          },
+          {
+            arrayFilters: [{ 'elem.uniqueId': uniqueid }],
+            new: false
+          }
+        ).catch(() => {});
+
+        // Broadcast completion
+        wsServer.broadcastCallEvent(campaignId, uniqueid, 'completed', log, phone);
+        kafkaService.send('call-status', { 
+          campaignId, 
+          uniqueid, 
+          status: 'completed', 
+          mobile: phone,
+          isActive: false,
+          leadStatus
+        }).catch(() => {});
+
+        // Remove from active tracking
+        if (activeUniqueIds) {
+          activeUniqueIds.delete(uniqueid);
+        }
+        
+        break;
+      }
+
+      // Check for transcript updates
+      const currentTranscript = log.transcript || '';
+      if (currentTranscript !== lastTranscript && currentTranscript) {
+        lastTranscript = currentTranscript;
+        
+        // Broadcast transcript update
+        kafkaService.send('call-transcript-update', {
+          campaignId,
+          uniqueId: uniqueid,
+          transcript: currentTranscript,
+          mobile: phone,
+          status: 'ongoing',
+          isActive: true
+        }).catch(() => {});
+      }
+
+      // Wait before next check
+      await new Promise(resolve => setTimeout(resolve, checkInterval));
+    } catch (error) {
+      console.error(`[KAFKA-CONSUMER] Error monitoring call ${uniqueid}:`, error);
+      // Wait before retry
+      await new Promise(resolve => setTimeout(resolve, checkInterval));
+    }
+  }
 }
 
 async function handleStopCampaign(command) {

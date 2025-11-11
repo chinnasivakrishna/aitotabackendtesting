@@ -18,6 +18,11 @@ const campaignSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  status: {
+    type: String,
+    enum: ['pending', 'start', 'stop', 'pause', 'resume', 'running', 'completed', 'failed'],
+    default: 'pending'
+  },
   agent: [{
     type: String,
     trim: true
@@ -49,7 +54,7 @@ const campaignSchema = new mongoose.Schema({
     },
     status: { 
       type: String, 
-      enum: ['ringing', 'ongoing', 'completed'], 
+      enum: ['ringing', 'ongoing', 'completed', 'not_connected', 'failed', 'pending'], 
       default: 'ringing' 
     },
     runId:{

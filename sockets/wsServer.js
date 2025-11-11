@@ -289,7 +289,7 @@ function sendMessage(ws, data) {
   }
 }
 
-// Start polling for a uniqueId
+// Start polling for a uniqueId (optimized for production)
 function startUniqueIdPoller(connectionId, uniqueId, ws) {
   // Stop existing poller if any
   stopUniqueIdPoller(connectionId);
@@ -299,7 +299,10 @@ function startUniqueIdPoller(connectionId, uniqueId, ws) {
     ws,
     running: false,
     timer: null,
-    lastTranscript: null
+    lastTranscript: null,
+    lastStatus: null,
+    consecutiveErrors: 0,
+    completedChecks: 0
   };
 
   const poll = async () => {
@@ -307,9 +310,78 @@ function startUniqueIdPoller(connectionId, uniqueId, ws) {
     poller.running = true;
 
     try {
-      await sendTranscriptUpdate(ws, uniqueId);
+      const callLog = await CallLog.findOne({ 
+        'metadata.customParams.uniqueid': uniqueId 
+      }).lean();
+
+      if (!callLog) {
+        // Call log not found - send update but don't spam
+        if (poller.consecutiveErrors < 3) {
+          sendMessage(ws, {
+            event: 'transcript-update',
+            uniqueId,
+            found: false,
+            message: 'Call log not found'
+          });
+          poller.consecutiveErrors++;
+        }
+        return;
+      }
+
+      // Reset error counter on success
+      poller.consecutiveErrors = 0;
+
+      const formatted = formatCallLogEntry(callLog);
+      if (formatted) {
+        const currentTranscript = formatted.transcript?.text || '';
+        const currentStatus = formatted.status || 'unknown';
+        const isActive = formatted.metadata?.isActive || false;
+        
+        // Only send update if transcript or status changed (reduce unnecessary updates)
+        const transcriptChanged = currentTranscript !== poller.lastTranscript;
+        const statusChanged = currentStatus !== poller.lastStatus;
+        
+        if (transcriptChanged || statusChanged || isActive) {
+          sendMessage(ws, {
+            event: 'transcript-update',
+            uniqueId,
+            found: true,
+            call: formatted,
+            transcript: formatted.transcript,
+            mobile: formatted.mobile,
+            status: currentStatus,
+            isActive,
+            updatedAt: formatted.updatedAt
+          });
+          
+          poller.lastTranscript = currentTranscript;
+          poller.lastStatus = currentStatus;
+          
+          // If call is completed, stop polling after a few more checks
+          if (!isActive && currentStatus === 'completed') {
+            // Track completed checks - stop after 3 final checks
+            if (!poller.completedChecks) poller.completedChecks = 0;
+            poller.completedChecks++;
+            if (poller.completedChecks >= 3) {
+              stopUniqueIdPoller(connectionId);
+            }
+          }
+        }
+      }
     } catch (error) {
       console.error(`[wsServer] Poll error for ${uniqueId}:`, error?.message);
+      poller.consecutiveErrors++;
+      
+      // Stop polling after too many consecutive errors
+      if (poller.consecutiveErrors >= 10) {
+        console.warn(`[wsServer] Stopping poller for ${uniqueId} due to too many errors`);
+        stopUniqueIdPoller(connectionId);
+        sendMessage(ws, {
+          event: 'error',
+          message: 'Polling stopped due to errors',
+          uniqueId
+        });
+      }
     } finally {
       poller.running = false;
     }
@@ -318,7 +390,7 @@ function startUniqueIdPoller(connectionId, uniqueId, ws) {
   // Poll immediately
   poll();
   
-  // Then poll at intervals
+  // Then poll at intervals (adaptive based on call status)
   poller.timer = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       poll();
@@ -506,38 +578,64 @@ function broadcastCampaignEvent(campaignId, event, payload) {
   console.log(`📢 [WEBSOCKET] Broadcast campaign event: ${event} for campaign ${campaignIdStr} to ${campaignSubscriptions.size} subscribers`);
 }
 
-function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
+function broadcastCallEvent(campaignId, uniqueId, status, callLog, phone = null) {
   if (!wss) return;
   
   const campaignIdStr = String(campaignId);
   const formattedLog = callLog ? formatCallLogEntry(callLog) : null;
+  
+  // Determine isActive from status or callLog
+  let isActive = false;
+  if (status === 'ongoing') {
+    isActive = true;
+  } else if (formattedLog) {
+    isActive = formattedLog.metadata?.isActive || false;
+  }
+  
+  // Get mobile from phone parameter, formattedLog, or callLog
+  const mobile = phone || formattedLog?.mobile || (callLog && (callLog.mobile || callLog?.metadata?.customParams?.customercontact)) || null;
   
   // Prepare call update data
   const callUpdate = {
     uniqueId,
     status,
     campaignId: campaignIdStr,
-    mobile: formattedLog?.mobile || null,
-    leadStatus: formattedLog?.leadStatus || null,
-    isActive: formattedLog?.metadata?.isActive || false,
+    mobile,
+    leadStatus: formattedLog?.leadStatus || (callLog && callLog.leadStatus) || null,
+    isActive,
     timestamp: new Date().toISOString()
   };
   
   // 1. Send to connections tracking this specific uniqueId (for transcript updates)
   for (const [connectionId, poller] of uniqueIdPollers.entries()) {
     if (poller.uniqueId === uniqueId && poller.ws && poller.ws.readyState === WebSocket.OPEN) {
-      if (formattedLog) {
-        sendMessage(poller.ws, {
-          event: 'transcript-update',
-          uniqueId,
-          found: true,
-          call: formattedLog,
-          transcript: formattedLog.transcript,
-          mobile: formattedLog.mobile,
-          status: formattedLog.status,
-          isActive: formattedLog.metadata?.isActive || false,
-          updatedAt: formattedLog.updatedAt
-        });
+      if (formattedLog || callLog) {
+        // If we have a callLog but not formatted, format it now
+        const logToFormat = formattedLog || (callLog ? formatCallLogEntry(callLog) : null);
+        if (logToFormat) {
+          sendMessage(poller.ws, {
+            event: 'transcript-update',
+            uniqueId,
+            found: true,
+            call: logToFormat,
+            transcript: logToFormat.transcript,
+            mobile: logToFormat.mobile || mobile,
+            status: status || logToFormat.status,
+            isActive: isActive || logToFormat.metadata?.isActive || false,
+            updatedAt: logToFormat.updatedAt || new Date().toISOString()
+          });
+        } else {
+          // Send basic update even without full log
+          sendMessage(poller.ws, {
+            event: 'transcript-update',
+            uniqueId,
+            found: false,
+            status,
+            mobile,
+            isActive,
+            message: 'Call log not yet available'
+          });
+        }
       }
     }
   }
@@ -552,7 +650,7 @@ function broadcastCallEvent(campaignId, uniqueId, status, callLog) {
     }
   }
   
-  console.log(`📢 [WEBSOCKET] Broadcast call event: ${status} for uniqueId ${uniqueId} in campaign ${campaignIdStr}`);
+  console.log(`📢 [WEBSOCKET] Broadcast call event: ${status} for uniqueId ${uniqueId} in campaign ${campaignIdStr}, mobile: ${mobile}, isActive: ${isActive}`);
 }
 
 function getStatus() {
